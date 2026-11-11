@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- viewport-fit=cover: the app draws edge to edge and pads itself with env(safe-area-inset-*) -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Chat, map and repeaters for your MeshCore radio" />
+    <!-- status bar and browser chrome; lib/theme.tsx updates these when the in-app theme changes -->
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <!-- installable: Share → Add to Home Screen on iOS, Install on Android/desktop Chrome -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="MeshChat" />
+    <!-- default: the page starts below an opaque status bar (black-translucent draws under it, where iOS 26+
+         blurs whatever is there). iOS reads this only when the icon is added to the Home Screen. -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <style>
+      /* before the app's CSS loads: the band's colour must already be solid */
+      #ios-top-band { position: fixed; top: 0; left: 0; right: 0; height: max(12px, env(safe-area-inset-top)); z-index: 2147483647; background-color: #fff; background-clip: text; -webkit-background-clip: text; color: transparent; }
+      @media (prefers-color-scheme: dark) { #ios-top-band { background-color: #0a0a0a; } }
+    </style>
+    <title>MeshChat</title>
+  </head>
+  <body>
+    <!-- iOS 26+ home-screen app: iOS lays a blur over the top of the page unless WebKit, probing a point
+         4 px below the middle of the top edge, finds a fixed element there that spans the width, is taller
+         than 10 px and has a background colour (LocalFrameView::fixedContainerEdges); then it extends that
+         colour instead. This band is that element: in the HTML so it's there from the first frame, on top of
+         everything, taking hits (some iOS versions skip pointer-events: none), and painting nothing
+         (background-clip: text with no text) so the header shows through. Styles in index.css. -->
+    <div id="ios-top-band" aria-hidden="true"></div>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

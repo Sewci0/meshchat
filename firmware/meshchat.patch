@@ -1,0 +1,4070 @@
+diff --git a/examples/companion_radio/DataStore.cpp b/examples/companion_radio/DataStore.cpp
+index 06c56a7..9a944f0 100644
+--- a/examples/companion_radio/DataStore.cpp
++++ b/examples/companion_radio/DataStore.cpp
+@@ -42,6 +42,45 @@ static File openWrite(FILESYSTEM* fs, const char* filename) {
+ #endif
+ }
+ 
++// Contacts and channels are rewritten whole on every change (contacts 5 s after any advert
++// updates one). Written in place, a reset or power cut mid-write cut the file short, and every
++// contact after that point was gone on the next boot. On ESP32 (MeshChat) they're written to a
++// side file and swapped in once complete; an interrupted swap is finished at the next load.
++#if defined(ESP32)
++  #define SAFE_SWAP 1
++#endif
++
++static String sideName(const char* filename) { return String(filename) + ".new"; }
++
++static File openWriteSafe(FILESYSTEM* fs, const char* filename) {
++#ifdef SAFE_SWAP
++  return openWrite(fs, sideName(filename).c_str());
++#else
++  return openWrite(fs, filename);
++#endif
++}
++
++static void commitSafe(FILESYSTEM* fs, const char* filename, File& file, bool ok) {
++  file.close();
++#ifdef SAFE_SWAP
++  String side = sideName(filename);
++  if (!ok) { fs->remove(side.c_str()); return; }   // keep the last good file
++  fs->remove(filename);
++  fs->rename(side.c_str(), filename);              // if this is cut short, recoverSafe() finishes it
++#endif
++}
++
++// Before reading: the main file wins while it exists (a side file next to it may be half-written);
++// a side file alone means the swap was interrupted after the old file was removed: finish it.
++static void recoverSafe(FILESYSTEM* fs, const char* filename) {
++#ifdef SAFE_SWAP
++  String side = sideName(filename);
++  if (!fs->exists(side.c_str())) return;
++  if (fs->exists(filename)) fs->remove(side.c_str());
++  else fs->rename(side.c_str(), filename);
++#endif
++}
++
+ #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+   static uint32_t _ContactsChannelsTotalBlocks = 0;
+ #endif
+@@ -257,6 +296,7 @@ bool DataStore::savePrefs(NodePrefs& _prefs) {
+ }
+ 
+ void DataStore::loadContacts(DataStoreHost* host) {
++recoverSafe(_getContactsChannelsFS(), "/contacts3");
+ File file = openRead(_getContactsChannelsFS(), "/contacts3");
+     if (file) {
+       bool full = false;
+@@ -288,8 +328,9 @@ File file = openRead(_getContactsChannelsFS(), "/contacts3");
+ }
+ 
+ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
+-  File file = openWrite(_getContactsChannelsFS(), "/contacts3");
++  File file = openWriteSafe(_getContactsChannelsFS(), "/contacts3");
+   if (file) {
++    bool ok = true;
+     uint32_t idx = 0;
+     ContactInfo c;
+     uint8_t unused = 0;
+@@ -312,15 +353,16 @@ void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactIn
+       success = success && (file.write((uint8_t *)&c.gps_lat, 4) == 4);
+       success = success && (file.write((uint8_t *)&c.gps_lon, 4) == 4);
+ 
+-      if (!success) break; // write failed
++      if (!success) { ok = false; break; } // write failed
+ 
+       idx++;  // advance to next contact
+     }
+-    file.close();
++    commitSafe(_getContactsChannelsFS(), "/contacts3", file, ok);
+   }
+ }
+ 
+ void DataStore::loadChannels(DataStoreHost* host) {
++    recoverSafe(_getContactsChannelsFS(), "/channels2");
+     File file = openRead(_getContactsChannelsFS(), "/channels2");
+     if (file) {
+       bool full = false;
+@@ -346,8 +388,9 @@ void DataStore::loadChannels(DataStoreHost* host) {
+ }
+ 
+ void DataStore::saveChannels(DataStoreHost* host) {
+-  File file = openWrite(_getContactsChannelsFS(), "/channels2");
++  File file = openWriteSafe(_getContactsChannelsFS(), "/channels2");
+   if (file) {
++    bool ok = true;
+     uint8_t channel_idx = 0;
+     ChannelDetails ch;
+     uint8_t unused[4];
+@@ -358,10 +401,10 @@ void DataStore::saveChannels(DataStoreHost* host) {
+       success = success && (file.write((uint8_t *)ch.name, 32) == 32);
+       success = success && (file.write((uint8_t *)ch.channel.secret, 32) == 32);
+ 
+-      if (!success) break; // write failed
++      if (!success) { ok = false; break; } // write failed
+       channel_idx++;
+     }
+-    file.close();
++    commitSafe(_getContactsChannelsFS(), "/channels2", file, ok);
+   }
+ }
+ 
+diff --git a/examples/companion_radio/MyMesh.cpp b/examples/companion_radio/MyMesh.cpp
+index f32ea67..994930a 100644
+--- a/examples/companion_radio/MyMesh.cpp
++++ b/examples/companion_radio/MyMesh.cpp
+@@ -3,8 +3,14 @@
+ #include <Arduino.h> // needed for PlatformIO
+ #ifdef ENABLE_WIFI_INTERFACE
+ #include <WiFi.h>
++#ifdef WIFI_PORTAL
++  #include "WifiPortal.h"
++#endif
+ #endif
+ #include <Mesh.h>
++#ifdef WEB_UI
++  #include "WebUi.h"
++#endif
+ 
+ #define CMD_APP_START                 1
+ #define CMD_SEND_TXT_MSG              2
+@@ -222,6 +228,9 @@ bool MyMesh::Frame::isChannelMsg() const {
+ }
+ 
+ void MyMesh::addToOfflineQueue(const uint8_t frame[], int len) {
++#ifdef WEB_UI
++  webui::onQueued(frame, len);   // the web UI keeps its own copy; the queue stays for the apps
++#endif
+   if (offline_queue_len >= OFFLINE_QUEUE_SIZE) {
+     MESH_DEBUG_PRINTLN("WARN: offline_queue is full!");
+     int pos = 0;
+@@ -1130,6 +1139,9 @@ void MyMesh::handleCmdFrame(size_t len) {
+     memcpy(&out_frame[1], reply_buf, rlen);
+     _serial->writeFrame(out_frame, 1 + rlen);
+   } else if (cmd_frame[0] == CMD_SEND_TXT_MSG && len >= 14) {
++#ifdef WEB_UI
++    webui::onAppSend(cmd_frame, len);
++#endif
+     int i = 1;
+     uint8_t txt_type = cmd_frame[i++];
+     uint8_t attempt = cmd_frame[i++];
+@@ -1176,6 +1188,9 @@ void MyMesh::handleCmdFrame(size_t len) {
+                         : ERR_CODE_UNSUPPORTED_CMD); // unknown recipient, or unsupported TXT_TYPE_*
+     }
+   } else if (cmd_frame[0] == CMD_SEND_CHANNEL_TXT_MSG) { // send GroupChannel text msg
++#ifdef WEB_UI
++    webui::onAppSend(cmd_frame, len);
++#endif
+     int i = 1;
+     uint8_t txt_type = cmd_frame[i++]; // should be TXT_TYPE_PLAIN
+     uint8_t channel_idx = cmd_frame[i++];
+@@ -1315,6 +1330,9 @@ void MyMesh::handleCmdFrame(size_t len) {
+       writeErrFrame(ERR_CODE_TABLE_FULL);
+     }
+   } else if (cmd_frame[0] == CMD_RESET_PATH && len >= 1 + 32) {
++#ifdef WEB_UI
++    webui::onAppSend(cmd_frame, len);   // the web UI notes the route before it's forgotten
++#endif
+     uint8_t *pub_key = &cmd_frame[1];
+     ContactInfo *recipient = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+     if (recipient) {
+@@ -2143,7 +2161,7 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
+     return true;
+   }
+   if (strcmp(command, "get wifi.pwd") == 0) {
+-    sprintf(reply, "> %s", _prefs.wifi_pwd);
++    strcpy(reply, _prefs.wifi_pwd[0] ? "> (set)" : "> (not set)");   // MeshChat: never echo the password
+     return true;
+   }
+   if (strcmp(command, "set wifi.clear") == 0) {
+@@ -2171,6 +2189,36 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
+     strcpy(reply, WiFi.status() == WL_CONNECTED ? "> connected" : "> disconnected");
+     return true;
+   }
++#ifdef WIFI_PORTAL
++  if (memcmp(command, "set wifi.hostname ", 18) == 0) {
++    if (!wifinet::validHostname(&command[18])) {
++      strcpy(reply, "Error: hostname is a-z, 0-9 and -, up to 32");
++    } else {
++      StrHelper::strncpy(_prefs.wifi_hostname, &command[18], sizeof(_prefs.wifi_hostname));
++      savePrefs();
++      wifinet::hostnameChanged();
++      sprintf(reply, "> wifi.hostname is now %s", wifinet::hostname());
++    }
++    return true;
++  }
++  if (strcmp(command, "get wifi.hostname") == 0) {
++    sprintf(reply, "> %s", wifinet::hostname());
++    return true;
++  }
++  if (strcmp(command, "set wifi.setup") == 0) {
++    wifinet::requestSetup();
++    strcpy(reply, "> setup hotspot starting");
++    return true;
++  }
++  if (strcmp(command, "get wifi.mode") == 0) {
++    sprintf(reply, "> %s", wifinet::modeName());
++    return true;
++  }
++  if (strcmp(command, "get wifi.rssi") == 0) {
++    sprintf(reply, "> %d", wifinet::rssi());
++    return true;
++  }
++#endif
+   if (strcmp(command, "get wifi.ip") == 0) {
+     if (WiFi.status() == WL_CONNECTED) {
+       sprintf(reply, "> %s", WiFi.localIP().toString().c_str());
+diff --git a/examples/companion_radio/MyMesh.h b/examples/companion_radio/MyMesh.h
+index 944790d..b0f5be6 100644
+--- a/examples/companion_radio/MyMesh.h
++++ b/examples/companion_radio/MyMesh.h
+@@ -194,6 +194,9 @@ protected:
+   }
+ 
+ public:
++  // MeshChat: before a restart (Restart, or a firmware update), write contacts that would otherwise
++  // be saved lazily a few seconds later, so the last changes aren't lost
++  void flushToFlash() { if (dirty_contacts_expiry) { saveContacts(); dirty_contacts_expiry = 0; } }
+   void savePrefs() {
+     _prefs.node_lat = sensors.node_lat;
+     _prefs.node_lon = sensors.node_lon;
+@@ -290,4 +293,11 @@ private:
+   AdvertPath advert_paths[ADVERT_PATH_TABLE_SIZE]; // circular table
+ };
+ 
+-extern MyMesh the_mesh;
++#ifdef MESH_IN_PSRAM
++  // ~117 KB, mostly the contacts table. Kept in PSRAM so WiFi, Bluetooth and TLS have internal RAM;
++  // constructed at the start of setup(), because PSRAM comes up after global constructors run.
++  extern MyMesh* the_mesh_ptr;
++  #define the_mesh (*the_mesh_ptr)
++#else
++  extern MyMesh the_mesh;
++#endif
+diff --git a/examples/companion_radio/NodePrefs.h b/examples/companion_radio/NodePrefs.h
+index 46a3dbb..b3427a7 100644
+--- a/examples/companion_radio/NodePrefs.h
++++ b/examples/companion_radio/NodePrefs.h
+@@ -55,6 +55,7 @@ public:
+   char wifi_ssid[33] = {0};   // if empty, the compile-time WIFI_SSID is used
+   char wifi_pwd[64] = {0};
+   uint8_t wifi_enabled = 1; // enabled by default to allow wifi only builds to work. wifi won't be started if ssid is empty
++  char wifi_hostname[33] = {0};   // MeshChat: DHCP + mDNS name; empty = meshcore-<mac suffix>
+   // use ssid from prefs, or fallback to ssid from build flags
+   const char* getWifiSSID() const { return wifi_ssid[0] ? wifi_ssid : WIFI_SSID; }
+ #endif
+@@ -182,6 +183,7 @@ private:
+       def("ssid", _parent->wifi_ssid, sizeof(_parent->wifi_ssid));
+       def("pwd", _parent->wifi_pwd, sizeof(_parent->wifi_pwd));
+       def("enabled", _parent->wifi_enabled);
++      def("host", _parent->wifi_hostname, sizeof(_parent->wifi_hostname));
+     }
+   public:
+     WiFiPrefs(NodePrefs* parent) : _parent(parent) { }
+diff --git a/examples/companion_radio/PublicCa.h b/examples/companion_radio/PublicCa.h
+new file mode 100644
+index 0000000..186c845
+--- /dev/null
++++ b/examples/companion_radio/PublicCa.h
+@@ -0,0 +1,37 @@
++// ISRG Root X1 (Let's Encrypt), valid until 2035-06-04.
++// SHA-256 96:BC:EC:06:26:49:76:F3:74:60:77:9A:CF:28:C5:A7:CF:E8:A3:C0:AA:E1:1A:8F:FC:EE:05:C0:BD:DF:08:C6
++// map.meshcore.io chains to it (YE2 -> Root YE -> ISRG Root X2 -> X1).
++#pragma once
++static const char ISRG_ROOT_X1[] =
++  "-----BEGIN CERTIFICATE-----\n"
++  "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n"
++  "TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh\n"
++  "cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4\n"
++  "WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu\n"
++  "ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY\n"
++  "MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc\n"
++  "h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+\n"
++  "0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U\n"
++  "A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW\n"
++  "T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH\n"
++  "B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC\n"
++  "B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv\n"
++  "KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn\n"
++  "OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn\n"
++  "jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw\n"
++  "qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI\n"
++  "rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV\n"
++  "HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq\n"
++  "hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL\n"
++  "ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ\n"
++  "3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK\n"
++  "NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5\n"
++  "ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur\n"
++  "TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC\n"
++  "jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc\n"
++  "oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq\n"
++  "4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA\n"
++  "mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d\n"
++  "emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=\n"
++  "-----END CERTIFICATE-----\n"
++  ;
+diff --git a/examples/companion_radio/WebUi.cpp b/examples/companion_radio/WebUi.cpp
+new file mode 100644
+index 0000000..551a060
+--- /dev/null
++++ b/examples/companion_radio/WebUi.cpp
+@@ -0,0 +1,2932 @@
++// See WebUi.h. MeshChat on the radio: built-in companion app + history + HTTP/WebSocket API.
++#ifdef WEB_UI
++#include "WebUi.h"
++#include "MyMesh.h"
++#include "NodePrefs.h"
++#ifdef WIFI_PORTAL
++  #include "WifiPortal.h"
++#endif
++#include <Arduino.h>
++#include <ArduinoJson.h>
++#include <AsyncJson.h>
++#include <AsyncTCP.h>
++#include <ESPAsyncWebServer.h>
++#include <HTTPClient.h>
++#include <WiFiClientSecure.h>
++#include <SPIFFS.h>
++#include <Update.h>
++#include <esp_ota_ops.h>
++#include <Utils.h>
++#include <WiFi.h>
++#include <esp_heap_caps.h>
++#include <time.h>
++#include <algorithm>
++#include <deque>
++#include <memory>
++#include "WebUiAssets.h"
++#include "PublicCa.h"
++#include <esp32s3/rom/miniz.h>   // tinfl (inflate) is in the S3 ROM
++
++#ifndef WEBUI_HOME_LAT
++  #define WEBUI_HOME_LAT 0.0
++  #define WEBUI_HOME_LON 0.0
++#endif
++
++namespace webui {
++namespace {
++
++// ---------------------------------------------------------------- limits
++const int MAX_MSGS = 2000;          // kept in PSRAM, persisted to flash
++const int MAX_PKTS = 3000;          // RX log, PSRAM only (the browser derives repeater stats from it)
++const int MAX_HEARD = 400;
++const int RF_RING = 48;             // recent decrypted channel packets, to attach routes/SNR
++const size_t HIST_FILE_CAP = 160 * 1024;   // two rotating files -> at most ~320 KB on flash
++const uint32_t CHAN_RETRY_WAIT = 8000;
++const int MAX_TEXT = 150;
++
++// companion protocol codes (see MyMesh.cpp)
++enum : uint8_t {
++  CMD_SEND_TXT_MSG = 2, CMD_SEND_CHANNEL_TXT_MSG = 3, CMD_SET_DEVICE_TIME = 6, CMD_SEND_SELF_ADVERT = 7,
++  CMD_SET_ADVERT_NAME = 8, CMD_ADD_UPDATE_CONTACT = 9, CMD_SET_RADIO_PARAMS = 11, CMD_SYNC_NEXT_MESSAGE = 10, CMD_RESET_PATH = 13, CMD_DEVICE_QUERY = 22, CMD_SEND_LOGIN = 26,
++  CMD_SEND_STATUS_REQ = 27, CMD_LOGOUT = 29, CMD_SET_CHANNEL = 32, CMD_SEND_BINARY_REQ = 50,
++  RESP_OK = 0, RESP_ERR = 1, RESP_SENT = 6, RESP_CONTACT_MSG = 7, RESP_CHANNEL_MSG = 8, RESP_NO_MORE = 10,
++  RESP_CONTACT_MSG_V3 = 16, RESP_CHANNEL_MSG_V3 = 17,
++  PUSH_ADVERT = 0x80, PUSH_PATH = 0x81, PUSH_ACK = 0x82, PUSH_WAITING = 0x83, PUSH_LOGIN_OK = 0x85, PUSH_LOGIN_FAIL = 0x86,
++  PUSH_STATUS = 0x87, PUSH_RX_LOG = 0x88, PUSH_NEW_ADVERT = 0x8A, PUSH_BINARY = 0x8C,
++};
++enum Kind : uint8_t { K_NONE, K_SEND_DM, K_SEND_CH, K_NAME, K_CHANNEL, K_ADVERT, K_QUERY, K_RADIO, K_OTHER, K_CONTACT, K_CLI };
++enum : uint8_t { ST_RECEIVED, ST_SENDING, ST_SENT, ST_REPEATED, ST_NOT_HEARD, ST_DELIVERED, ST_NO_ACK, ST_FAILED };
++const char* ST_NAME[] = {"received", "sending", "sent", "repeated", "not heard", "delivered", "no ack", "failed"};
++const char* TYPE_NAME[] = {"unknown", "companion", "repeater", "room", "sensor"};
++const char* PKT_NAME[16] = {"REQ", "RESPONSE", "TXT_MSG", "ACK", "ADVERT", "GRP_TXT", "GRP_DATA", "ANON_REQ",
++                            "PATH", "TRACE", "MULTIPART", "CONTROL", "UNK12", "UNK13", "UNK14", "RAW_CUSTOM"};
++const char* ROUTE_NAME[4] = {"TRANSPORT_FLOOD", "FLOOD", "DIRECT", "TRANSPORT_DIRECT"};
++
++// ---------------------------------------------------------------- data
++struct Msg {
++  uint32_t id, ts, sender_ts;
++  uint8_t kind, chan, dir;          // kind 0 = channel, 1 = DM; dir 0 = in, 1 = out
++  int8_t hops;                      // -1 unknown
++  uint8_t key[32];                  // DM peer
++  uint8_t hash_size, path_n, path[32];
++  int16_t snr4, rssi;               // rssi 0 = unknown
++  uint8_t status, repeats, attempts, has_rf;
++  uint32_t acks[3], retry_at;
++  char sender[32];
++  char text[MAX_TEXT + 18];
++  uint16_t net;                     // the network (radio settings) it was on: channels are kept per network
++  uint8_t deleted;                  // deleted by the user: kept out of every view (the record says so in flash)
++  uint32_t fp;                      // its packet's fingerprint (payloadFp), shared by every copy heard; 0 unknown
++  // our DMs: per try, bit k = it went out by flood, bit 4+k = we saw it go out (older records: none);
++  // which try the ACK answered, and the radio's round trip for it
++  uint8_t flood_mask, ack_try; uint32_t rtt_ms;
++  uint8_t author[4], has_author;    // room posts: the first bytes of the author's key
++};
++struct Pkt {
++  uint32_t id, ts;
++  uint8_t route, type, hops, hash_size, path_n, path[32];
++  int16_t snr4;
++  int8_t rssi;
++  uint8_t node_type;                // adverts
++  char name[32];                    // advert name / channel name
++  char key[13];                     // advert key prefix / private channel hash
++  uint16_t net;
++  uint32_t fp, ms;                  // payload fingerprint (the same on every copy); millis() when heard
++  uint8_t raw_len, raw[255];        // the packet as received: header, transport codes, path, payload
++};
++struct Heard {
++  uint8_t key[32];
++  char name[32];
++  uint8_t type, has_loc, hops, hash_size, path_n, path[32];
++  int32_t lat, lon;                 // 1e-6 degrees
++  uint32_t first, last, count;
++  int16_t snr4;
++  int8_t rssi;
++  uint16_t net;                     // heard on this network (the map shows the current one's)
++};
++struct Rf { uint32_t h, at, ts, fp; uint8_t hops, hash_size, path_n, path[32]; int16_t snr4; int8_t rssi; };
++struct ChanInfo { uint8_t idx, hash; uint8_t secret[32]; char name[32]; };
++struct Cmd { uint8_t buf[MAX_FRAME_SIZE]; uint8_t len; Kind kind; uint32_t ctx; };
++enum ActType : uint8_t { A_SEND, A_RESEND, A_ADVERT, A_NAME, A_CH_SET, A_TIME, A_HOSTNAME, A_JOIN, A_PIN, A_HOME, A_REBOOT, A_QUERY, A_RADIO, A_NET_ADD, A_NET_REMOVE, A_NET_PREFER, A_DELETE, A_DELETE_CONV, A_CONTACT_ADD, A_RESET_PATH, A_ROOM_LEAVE, A_CLI };
++struct Action { ActType type; uint32_t id; int32_t a; double lat, lon; uint8_t secret[16]; uint8_t key[32]; char s1[64]; char s2[64]; uint16_t net; char text[160]; };
++
++MyMesh* mesh = nullptr;
++SemaphoreHandle_t mtx;
++struct Lock { Lock() { xSemaphoreTakeRecursive(mtx, portMAX_DELAY); } ~Lock() { xSemaphoreGiveRecursive(mtx); } };
++
++Msg* msgs = nullptr;  int msg_head = 0, msg_count = 0;  uint32_t next_msg_id = 1;
++Pkt* pkts = nullptr;  int pkt_head = 0, pkt_count = 0;  uint32_t next_pkt_id = 1;
++Heard* heard = nullptr; int heard_count = 0;
++Rf rf[RF_RING]; int rf_head = 0;
++ChanInfo chans[MAX_GROUP_CHANNELS]; int chan_count = 0;
++std::deque<Cmd> cmds;                // main task only
++std::deque<Action> actions;          // web -> main, under lock
++Kind awaiting = K_NONE; uint32_t awaiting_ctx = 0, awaiting_since = 0;
++uint32_t app_dm = 0;   // a DM another app just sent: its RESP_SENT (ACK code) comes next
++bool contacts_dirty = true, chans_dirty = true; uint32_t last_snapshot = 0;
++char* snap_contacts = nullptr;  size_t snap_contacts_len = 0;   // cached JSON, PSRAM
++double home_lat = WEBUI_HOME_LAT, home_lon = WEBUI_HOME_LON;
++uint32_t advert_ts = 0; bool advert_flood = false; char advert_name[32] = {0};
++bool sntp_started = false;
++uint32_t restart_at = 0;
++
++// ---- firmware update over WiFi
++// Identifies a MeshChat build in a firmware file: the app looks for this text in an uploaded .bin.
++// Rebuilt with every compile of this file (and the app embedded in it), so each build differs.
++const char MESHCHAT_BUILD[] = "MESHCHAT-BUILD:" FIRMWARE_VERSION "-meshchat " __DATE__ " " __TIME__;
++// One upload at a time, written straight into the spare app slot as it arrives.
++struct Ota { bool active, ok, refused; size_t bytes; uint32_t started; char error[96]; };
++Ota ota = {};
++AsyncWebServer server(80);
++AsyncWebSocket ws("/ws");
++
++void* palloc(size_t n) {
++  void* p = heap_caps_calloc(1, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++  return p ? p : calloc(1, n);
++}
++
++uint32_t now_s() { return mesh->getRTCClock()->getCurrentTime(); }
++/** Which network the radio is on: frequency, bandwidth and SF (radios on the same three hear each
++ *  other; the coding rate is in each packet's header). Channels, packets and heard nodes are kept
++ *  per network; DMs are shared, being with the same person whichever network carried them. */
++uint16_t curNet() {
++  NodePrefs* np = mesh->getNodePrefs();
++  uint32_t v[3] = {(uint32_t)(np->freq * 1000 + 0.5f), (uint32_t)(np->bw * 1000 + 0.5f), np->sf};
++  uint32_t h = 2166136261u;
++  for (uint32_t x : v) for (int i = 0; i < 4; i++) { h ^= (x >> (8 * i)) & 0xFF; h *= 16777619u; }
++  return (uint16_t)(h ^ (h >> 16));
++}
++uint16_t legacy_net = 0;   // history from before networks were recorded: the network the radio was on then
++
++/** Unix time: from SNTP once the radio is on WiFi, otherwise MeshCore's clock (set by the apps). */
++uint32_t wallNow() { time_t t = time(nullptr); return t > 1700000000 ? (uint32_t)t : now_s(); }
++
++uint32_t fnv(uint32_t ts, const char* text) {
++  uint32_t h = 2166136261u;
++  for (int i = 0; i < 4; i++) { h ^= (ts >> (8 * i)) & 0xFF; h *= 16777619u; }
++  for (const char* c = text; *c; c++) { h ^= (uint8_t)*c; h *= 16777619u; }
++  return h;
++}
++
++void copyText(char* dst, size_t cap, const uint8_t* src, size_t n) {
++  if (n > cap - 1) n = cap - 1;
++  memcpy(dst, src, n);
++  dst[n] = 0;
++  while (n && dst[n - 1] == 0) n--;   // channel text may be zero-padded
++}
++
++// ---------------------------------------------------------------- packets
++// A packet's fingerprint: SHA-256 of its payload (no header or path), first 4 bytes little-endian,
++// which the meshcore Python library calls pkt_hash. Every copy of a packet has the same one,
++// whichever repeaters it came through, so it links a message to all the copies heard.
++uint32_t payloadFp(const uint8_t* pay, size_t len) {
++  uint8_t h[4]; uint32_t v;
++  mesh::Utils::sha256(h, 4, pay, (int)len);
++  memcpy(&v, h, 4);
++  return v;
++}
++
++// Where the payload starts in a raw packet: header, 4 bytes of transport codes on TRANSPORT_*
++// routes, the path length byte, then hops x hash size bytes of path.
++const uint8_t* rawPayload(const uint8_t* raw, size_t n, size_t& plen) {
++  size_t i = 1;
++  if (n < 2) { plen = 0; return raw; }
++  uint8_t route = raw[0] & 3;
++  if (route == 0 || route == 3) i += 4;
++  if (i >= n) { plen = 0; return raw; }
++  uint8_t pl = raw[i++];
++  i += (size_t)(pl & 0x3F) * ((pl >> 6) + 1);
++  if (i > n) { plen = 0; return raw; }
++  plen = n - i;
++  return raw + i;
++}
++
++// ---------------------------------------------------------------- UTF-8
++// Length (1-4) of the well-formed UTF-8 character at s, or 0 if the bytes there aren't one
++// (stray continuation bytes, overlong forms, surrogates, past U+10FFFF, or cut short by the NUL).
++int utf8Len(const unsigned char* s) {
++  unsigned char c = s[0], lo = 0x80, hi = 0xBF;
++  int n;
++  if (c < 0x80) return 1;
++  if (c >= 0xC2 && c <= 0xDF) n = 2;
++  else if (c >= 0xE0 && c <= 0xEF) { n = 3; if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F; }
++  else if (c >= 0xF0 && c <= 0xF4) { n = 4; if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F; }
++  else return 0;
++  if (s[1] < lo || s[1] > hi) return 0;            // a NUL here fails too, so we never read past it
++  for (int i = 2; i < n; i++) if (s[i] < 0x80 || s[i] > 0xBF) return 0;
++  return n;
++}
++
++// True if s is the start of a character that the end of the string cut short.
++bool utf8Cut(const unsigned char* s) {
++  int need = s[0] >= 0xF0 && s[0] <= 0xF4 ? 4 : s[0] >= 0xE0 ? 3 : s[0] >= 0xC2 && s[0] <= 0xDF ? 2 : 0;
++  if (!need) return false;
++  int i = 1;
++  while (s[i]) { if (i >= need || s[i] < 0x80 || s[i] > 0xBF) return false; i++; }
++  return i < need;
++}
++
++// ---------------------------------------------------------------- JSON writer into PSRAM
++struct Buf {
++  char* p = nullptr; size_t n = 0, cap = 0;
++  ~Buf() { if (p) free(p); }
++  bool grow(size_t need) {
++    if (n + need + 1 <= cap) return true;
++    size_t nc = cap ? cap * 2 : 4096;
++    while (nc < n + need + 1) nc *= 2;
++    char* np = (char*)heap_caps_realloc(p, nc, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    if (!np) np = (char*)realloc(p, nc);
++    if (!np) return false;
++    p = np; cap = nc;
++    return true;
++  }
++  void raw(const char* s, size_t len) { if (grow(len)) { memcpy(p + n, s, len); n += len; p[n] = 0; } }
++  void raw(const char* s) { raw(s, strlen(s)); }
++  void f(const char* fmt, ...) {
++    char tmp[192];
++    va_list a; va_start(a, fmt); int k = vsnprintf(tmp, sizeof(tmp), fmt, a); va_end(a);
++    if (k > 0) raw(tmp, (size_t)k < sizeof(tmp) ? (size_t)k : sizeof(tmp) - 1);
++  }
++  // Mesh text is untrusted, and not always valid UTF-8: names arrive cut off mid-emoji (the
++  // sender's 32-byte name field, or ours), and anyone can transmit arbitrary bytes. Escape what
++  // JSON requires and emit only well-formed UTF-8, or strict clients reject the whole response.
++  void str(const char* s) {
++    raw("\"", 1);
++    for (const unsigned char* c = (const unsigned char*)s; *c;) {
++      switch (*c) {
++        case '"': raw("\\\"", 2); c++; continue;
++        case '\\': raw("\\\\", 2); c++; continue;
++        case '\n': raw("\\n", 2); c++; continue;
++        case '\r': raw("\\r", 2); c++; continue;
++        case '\t': raw("\\t", 2); c++; continue;
++      }
++      if (*c < 0x20) { f("\\u%04x", *c); c++; continue; }
++      int n = utf8Len(c);
++      if (n) { raw((const char*)c, n); c += n; }
++      else if (utf8Cut(c)) break;               // a character cut off by truncation: drop it
++      else { raw("\xEF\xBF\xBD", 3); c++; }    // anything else: U+FFFD, one per bad byte
++    }
++    raw("\"", 1);
++  }
++  void hex(const uint8_t* b, size_t len) {
++    static const char* h = "0123456789abcdef";
++    raw("\"", 1);
++    for (size_t i = 0; i < len; i++) { char t[2] = {h[b[i] >> 4], h[b[i] & 15]}; raw(t, 2); }
++    raw("\"", 1);
++  }
++};
++
++// Keys go out in lowercase hex, like MeshChat's Python server, packet paths and the public map:
++// the browser matches path prefixes against them. (MeshCore's own toHex writes uppercase.)
++void hexLower(char* dest, const uint8_t* src, size_t len) {
++  static const char* h = "0123456789abcdef";
++  for (size_t i = 0; i < len; i++) { *dest++ = h[src[i] >> 4]; *dest++ = h[src[i] & 15]; }
++  *dest = 0;
++}
++
++bool hexToBytes(const char* s, uint8_t* out, size_t n) {
++  if (strlen(s) != n * 2) return false;
++  for (size_t i = 0; i < n; i++) {
++    auto v = [](char c) -> int { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
++    int hi = v(s[2 * i]), lo = v(s[2 * i + 1]);
++    if (hi < 0 || lo < 0) return false;
++    out[i] = (hi << 4) | lo;
++  }
++  return true;
++}
++
++// ---------------------------------------------------------------- message store
++Msg* msgAt(int i) { return &msgs[(msg_head - msg_count + i + MAX_MSGS) % MAX_MSGS]; }   // 0 = oldest
++Msg* findMsg(uint32_t id) {
++  for (int i = msg_count - 1; i >= 0; i--) if (msgAt(i)->id == id) return msgAt(i);
++  return nullptr;
++}
++Msg* newMsg() {
++  Msg* m = &msgs[msg_head];
++  memset(m, 0, sizeof(*m));
++  msg_head = (msg_head + 1) % MAX_MSGS;
++  if (msg_count < MAX_MSGS) msg_count++;
++  m->id = next_msg_id++;
++  m->hops = -1;
++  m->net = curNet();
++  return m;
++}
++/** shown in this network's views: not deleted, and DMs always, channels only from this network */
++bool visible(const Msg* m) { return !m->deleted && (m->kind == 1 || m->net == curNet()); }
++bool sameConv(const Msg* m, uint8_t kind, uint8_t chan, const uint8_t* key) {
++  return m->kind == kind && (kind == 0 ? m->chan == chan : memcmp(m->key, key, 32) == 0);
++}
++
++void convId(Buf& b, const Msg* m) {
++  if (m->kind == 0) b.f("\"chan:%u\"", m->chan);
++  else if (m->kind == 2) { char n[33]; memcpy(n, m->key, 32); n[32] = 0; b.f("\"watch:%s\"", n); }   // names are validated: no quotes
++  else { char h[65]; hexLower(h, m->key, 32); b.f("\"dm:%s\"", h); }
++}
++
++void msgJson(Buf& b, const Msg* m) {
++  b.f("{\"id\":%u,\"ts\":%u,\"sender_ts\":%u,\"conv\":", m->id, m->ts, m->sender_ts);
++  convId(b, m);
++  b.f(",\"direction\":\"%s\",\"sender\":", m->dir ? "out" : "in");
++  b.str(m->sender);
++  b.raw(",\"text\":");
++  b.str(m->text);
++  if (m->hops >= 0) b.f(",\"hops\":%d", m->hops); else b.raw(",\"hops\":null");
++  if (m->path_n) { b.raw(",\"path\":"); b.hex(m->path, m->path_n); b.f(",\"hash_size\":%u", m->hash_size); }
++  else b.f(",\"path\":%s,\"hash_size\":%u", m->has_rf && m->hops == 0 ? "\"\"" : "null", m->hash_size ? m->hash_size : 1);
++  if (m->has_rf) b.f(",\"snr\":%.2f,\"rssi\":%d", m->snr4 / 4.0, m->rssi); else b.raw(",\"snr\":null,\"rssi\":null");
++  if (m->kind == 1 && m->dir == 1 && (m->flood_mask & 0x70)) {   // our DMs: how each try went out, which the ACK answered, the round trip
++    b.raw(",\"tries_flood\":[");
++    for (int k = 0; k < 3 && (m->flood_mask >> (4 + k)) & 1; k++) b.f("%s%s", k ? "," : "", (m->flood_mask >> k) & 1 ? "true" : "false");
++    b.raw("]");
++    if (m->ack_try) b.f(",\"ack_try\":%u,\"rtt_ms\":%u", m->ack_try, m->rtt_ms);
++  }
++  if (m->has_author) { b.raw(",\"author\":"); b.hex(m->author, 4); }
++  b.f(",\"status\":\"%s\",\"repeats\":%u,\"attempts\":%u,\"msg_hash\":null}", ST_NAME[m->status], m->repeats, m->attempts ? m->attempts : 1);
++}
++
++// ---- persistence: two rotating JSON-lines files; updates are appended as small records
++const char* HIST[2] = {"/wu_hist0.jsonl", "/wu_hist1.jsonl"};
++int hist_cur = 0;
++
++void histAppend(const char* line, size_t n) {
++  File f = SPIFFS.open(HIST[hist_cur], FILE_APPEND);
++  if (!f) return;
++  if (f.size() + n > HIST_FILE_CAP) {   // rotate: the older file is dropped
++    f.close();
++    hist_cur ^= 1;
++    SPIFFS.remove(HIST[hist_cur]);
++    f = SPIFFS.open(HIST[hist_cur], FILE_APPEND);
++    if (!f) return;
++  }
++  f.write((const uint8_t*)line, n);
++  f.close();
++}
++
++void persistMsg(const Msg* m) {
++  Buf b;
++  b.f("{\"i\":%u,\"t\":%u,\"s\":%u,\"k\":%u,\"c\":%u,\"d\":%u,\"h\":%d,\"z\":%u,\"n\":%d,\"r\":%d,\"u\":%u,\"x\":%u,\"a\":%u,\"q\":%u,\"y\":",
++      m->id, m->ts, m->sender_ts, m->kind, m->chan, m->dir, m->hops, m->hash_size, m->snr4, m->rssi, m->status, m->repeats, m->attempts, m->has_rf);
++  b.hex(m->key, m->kind ? 32 : 0);
++  b.raw(",\"p\":"); b.hex(m->path, m->path_n);
++  b.raw(",\"f\":"); b.str(m->sender);
++  b.raw(",\"m\":"); b.str(m->text);
++  if (m->has_author) { b.raw(",\"A\":"); b.hex(m->author, 4); }
++  b.f(",\"w\":%u}\n", m->net);
++  histAppend(b.p, b.n);
++}
++void persistDelete(uint32_t id) { char l[32]; int n = snprintf(l, sizeof(l), "{\"X\":%u}\n", id); histAppend(l, n); }
++// a whole conversation: everything in it up to max_id (channels: on that network)
++void persistDeleteConv(uint8_t kind, uint8_t chan, const uint8_t* key, uint16_t net, uint32_t max_id) {
++  Buf b;
++  b.f("{\"XC\":%u,\"k\":%u,\"c\":%u,\"w\":%u,\"y\":", max_id, kind, chan, net);
++  b.hex(key, kind ? 32 : 0);
++  b.raw("}\n");
++  histAppend(b.p, b.n);
++}
++
++void persistUpdate(const Msg* m) {
++  Buf b;
++  b.f("{\"U\":%u,\"u\":%u,\"x\":%u,\"a\":%u,\"h\":%d,\"z\":%u,\"n\":%d,\"r\":%d,\"q\":%u,\"o\":%u,\"g\":%u,\"v\":%u,\"p\":",
++      m->id, m->status, m->repeats, m->attempts, m->hops, m->hash_size, m->snr4, m->rssi, m->has_rf, m->flood_mask, m->ack_try, m->rtt_ms);
++  b.hex(m->path, m->path_n);
++  b.raw("}\n");
++  histAppend(b.p, b.n);
++}
++
++void loadHistory() {
++  // older file first: the one that isn't being appended to
++  size_t s0 = 0, s1 = 0;
++  if (SPIFFS.exists(HIST[0])) { File f = SPIFFS.open(HIST[0]); s0 = f.size(); f.close(); }
++  if (SPIFFS.exists(HIST[1])) { File f = SPIFFS.open(HIST[1]); s1 = f.size(); f.close(); }
++  hist_cur = (s1 && (!s0 || s1 < HIST_FILE_CAP) && s0 >= HIST_FILE_CAP) ? 1 : (s0 ? 0 : (s1 ? 1 : 0));
++  int order[2] = {hist_cur ^ 1, hist_cur};
++  JsonDocument doc;
++  char line[640];
++  for (int o = 0; o < 2; o++) {
++    if (!SPIFFS.exists(HIST[order[o]])) continue;
++    File f = SPIFFS.open(HIST[order[o]]);
++    while (f.available()) {
++      size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
++      line[n] = 0;
++      if (!n || deserializeJson(doc, line)) continue;
++      if (doc["X"].is<uint32_t>()) { Msg* m = findMsg(doc["X"]); if (m) m->deleted = 1; continue; }
++      if (doc["XC"].is<uint32_t>()) {
++        uint32_t max_id = doc["XC"]; uint8_t k = doc["k"], c = doc["c"]; uint16_t w = doc["w"];
++        uint8_t key[32] = {0};
++        if (k) hexToBytes(doc["y"] | "", key, 32);
++        for (int i = 0; i < msg_count; i++) {
++          Msg* m = msgAt(i);
++          if (m->id <= max_id && sameConv(m, k, c, key) && (k == 1 || m->net == w)) m->deleted = 1;
++        }
++        continue;
++      }
++      if (doc["U"].is<uint32_t>()) {
++        Msg* m = findMsg(doc["U"]);
++        if (!m) continue;
++        m->status = doc["u"]; m->repeats = doc["x"]; m->attempts = doc["a"]; m->hops = doc["h"]; m->hash_size = doc["z"];
++        m->snr4 = doc["n"]; m->rssi = doc["r"]; m->has_rf = doc["q"];
++        m->flood_mask = doc["o"] | 0; m->ack_try = doc["g"] | 0; m->rtt_ms = doc["v"] | 0u;
++        const char* p = doc["p"] | "";
++        m->path_n = strlen(p) / 2 <= 32 && hexToBytes(p, m->path, strlen(p) / 2) ? strlen(p) / 2 : 0;
++        continue;
++      }
++      Msg* m = newMsg();
++      m->id = doc["i"]; m->ts = doc["t"]; m->sender_ts = doc["s"]; m->kind = doc["k"]; m->chan = doc["c"]; m->dir = doc["d"];
++      m->hops = doc["h"]; m->hash_size = doc["z"]; m->snr4 = doc["n"]; m->rssi = doc["r"]; m->status = doc["u"];
++      m->repeats = doc["x"]; m->attempts = doc["a"]; m->has_rf = doc["q"];
++      m->net = doc["w"] | legacy_net;   // older records: the network the radio was on when this was added
++      const char* y = doc["y"] | "";
++      if (m->kind) hexToBytes(y, m->key, 32);
++      const char* p = doc["p"] | "";
++      size_t pn = strlen(p) / 2;
++      m->path_n = pn <= 32 && hexToBytes(p, m->path, pn) ? pn : 0;
++      strlcpy(m->sender, doc["f"] | "", sizeof(m->sender));
++      strlcpy(m->text, doc["m"] | "", sizeof(m->text));
++      const char* au = doc["A"] | "";
++      m->has_author = strlen(au) == 8 && hexToBytes(au, m->author, 4);
++      if (m->id >= next_msg_id) next_msg_id = m->id + 1;
++      if (m->status == ST_SENDING || m->status == ST_SENT) m->status = m->kind ? ST_NO_ACK : ST_NOT_HEARD;   // retries died with the reboot
++    }
++    f.close();
++  }
++}
++
++void loadSmallState() {
++  if (!SPIFFS.exists("/wu_state.json")) return;
++  File f = SPIFFS.open("/wu_state.json");
++  JsonDocument doc;
++  if (!deserializeJson(doc, f)) {
++    home_lat = doc["lat"] | home_lat; home_lon = doc["lon"] | home_lon;
++    advert_ts = doc["adv_ts"] | 0u; advert_flood = doc["adv_flood"] | false;
++    strlcpy(advert_name, doc["adv_name"] | "", sizeof(advert_name));
++    legacy_net = doc["legacy_net"] | 0;
++  }
++  f.close();
++}
++
++void saveSmallState() {
++  JsonDocument doc;
++  doc["lat"] = home_lat; doc["lon"] = home_lon;
++  doc["adv_ts"] = advert_ts; doc["adv_flood"] = advert_flood; doc["adv_name"] = advert_name;
++  doc["legacy_net"] = legacy_net;
++  File f = SPIFFS.open("/wu_state.json", FILE_WRITE);
++  if (f) { serializeJson(doc, f); f.close(); }
++}
++
++// ---------------------------------------------------------------- live events
++void broadcast(const char* kind, Buf& data) {
++  if (!ws.count()) return;
++  Buf b;
++  b.f("{\"kind\":\"%s\",\"data\":", kind);
++  b.raw(data.p ? data.p : "null", data.p ? data.n : 4);
++  b.raw("}");
++  ws.textAll(b.p, b.n);
++}
++void emitMsg(const Msg* m) { Buf b; msgJson(b, m); broadcast("message", b); }
++void emitStale() { Buf b; b.raw("\"state\""); broadcast("stale", b); }
++void emitWifi() { Buf b; b.raw("\"wifi\""); broadcast("stale", b); }   // the saved networks changed
++
++// ---------------------------------------------------------------- commands to the mesh (main task)
++void queueCmd(Kind kind, uint32_t ctx, const uint8_t* buf, size_t len) {
++  Cmd c;
++  c.kind = kind; c.ctx = ctx; c.len = len > MAX_FRAME_SIZE ? MAX_FRAME_SIZE : len;
++  memcpy(c.buf, buf, c.len);
++  cmds.push_back(c);
++}
++void sendDm(Msg* m, bool reset_path) {
++  ContactInfo* c = mesh->lookupContactByPubKey(m->key, 32);
++  if (!c) { m->status = ST_FAILED; persistUpdate(m); emitMsg(m); return; }
++  if (reset_path) {
++    uint8_t f[33] = {CMD_RESET_PATH};
++    memcpy(&f[1], m->key, 32);
++    queueCmd(K_OTHER, 0, f, 33);
++  }
++  uint8_t f[MAX_FRAME_SIZE];
++  size_t i = 0, tl = strlen(m->text);
++  f[i++] = CMD_SEND_TXT_MSG; f[i++] = 0; f[i++] = m->attempts;
++  memcpy(&f[i], &m->sender_ts, 4); i += 4;
++  memcpy(&f[i], m->key, 6); i += 6;
++  if (i + tl > sizeof(f)) tl = sizeof(f) - i;
++  memcpy(&f[i], m->text, tl); i += tl;
++  m->retry_at = 0;
++  queueCmd(K_SEND_DM, m->id, f, i);
++}
++void sendChan(Msg* m) {
++  uint8_t f[MAX_FRAME_SIZE];
++  size_t i = 0, tl = strlen(m->text);
++  f[i++] = CMD_SEND_CHANNEL_TXT_MSG; f[i++] = 0; f[i++] = m->chan;
++  memcpy(&f[i], &m->sender_ts, 4); i += 4;   // same timestamp on retries: identical packet
++  if (i + tl > sizeof(f)) tl = sizeof(f) - i;
++  memcpy(&f[i], m->text, tl); i += tl;
++  m->retry_at = 0;
++  queueCmd(K_SEND_CH, m->id, f, i);
++}
++
++// ---------------------------------------------------------------- frames from the mesh (main task)
++void reloadChannels() {
++  Lock l;
++  chan_count = 0;
++  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
++    ChannelDetails cd;
++    if (!mesh->getChannel(i, cd) || !cd.name[0]) continue;
++    ChanInfo& c = chans[chan_count++];
++    c.idx = i; c.hash = cd.channel.hash[0];
++    memcpy(c.secret, cd.channel.secret, 32);
++    strlcpy(c.name, cd.name, sizeof(c.name));
++  }
++  chans_dirty = false;
++}
++const ChanInfo* chanByIdx(int idx) { for (int i = 0; i < chan_count; i++) if (chans[i].idx == idx) return &chans[i]; return nullptr; }
++
++bool seenAlready(uint8_t kind, uint8_t chan, const uint8_t* key, uint32_t sender_ts, const char* text) {
++  for (int i = msg_count - 1, n = 0; i >= 0 && n < 300; i--, n++) {
++    Msg* m = msgAt(i);
++    if (m->dir == 0 && m->sender_ts == sender_ts && sameConv(m, kind, chan, key) && strcmp(m->text, text) == 0) return true;
++  }
++  return false;
++}
++
++bool fpTaken(uint32_t fp);   // below, with the packet log
++
++bool roomLeft(const uint8_t* key);   // below, with the rooms
++
++void cliAnswer(const uint8_t* prefix, const uint8_t* text, size_t len);   // repeater admin, below
++
++void onContactMsg(const uint8_t* f, size_t len, bool v3) {
++  size_t i = 1;
++  int16_t snr4 = 0;
++  if (v3) { snr4 = (int8_t)f[i]; i += 3; }
++  if (len < i + 12) return;
++  const uint8_t* prefix = &f[i]; i += 6;
++  uint8_t plen = f[i++], txt_type = f[i++];
++  uint32_t ts; memcpy(&ts, &f[i], 4); i += 4;
++  if (txt_type == 1) { cliAnswer(prefix, &f[i], len - i); return; }   // a command's answer, not chat
++  const uint8_t* sig = nullptr;
++  if (txt_type == 2 && len >= i + 4) { sig = &f[i]; i += 4; }
++  char text[MAX_TEXT + 18];
++  copyText(text, sizeof(text), &f[i], len - i);
++  ContactInfo* c = mesh->lookupContactByPubKey(prefix, 6);
++  uint8_t key[32] = {0};
++  if (c) memcpy(key, c->id.pub_key, 32); else memcpy(key, prefix, 6);
++  Lock l;
++  if (seenAlready(1, 0, key, ts, text)) return;
++  Msg* m = newMsg();
++  m->ts = wallNow();
++  m->sender_ts = ts; m->kind = 1; m->dir = 0; memcpy(m->key, key, 32);
++  m->hops = plen == 255 ? -1 : (plen & 0x3F); m->hash_size = plen == 255 ? 1 : (plen >> 6) + 1;
++  m->status = ST_RECEIVED;
++  if (v3 && m->hops == 0) { m->snr4 = snr4; m->has_rf = 1; }
++  // Which packet was it? The companion doesn't say: find a TXT_MSG to us from that sender in the
++  // last 30 s, with the same hop count (and SNR, if direct), that no other message has claimed.
++  // That gives a DM its route and signal too, which the companion only reports for direct ones.
++  for (int q = 0; q < pkt_count && q < 64; q++) {
++    Pkt* p = &pkts[(pkt_head - 1 - q + MAX_PKTS) % MAX_PKTS];
++    if (millis() - p->ms > 30000) break;
++    size_t pn; const uint8_t* pay = rawPayload(p->raw, p->raw_len, pn);
++    if (p->type != 2 || pn < 4 || pay[0] != mesh->self_id.pub_key[0] || pay[1] != key[0]) continue;
++    if (m->hops >= 0 && p->hops != m->hops) continue;
++    if (v3 && m->hops == 0 && p->snr4 != snr4) continue;
++    if (fpTaken(p->fp)) continue;
++    m->fp = p->fp;
++    if (!m->has_rf || !m->path_n) {
++      m->path_n = p->path_n; memcpy(m->path, p->path, p->path_n); m->hash_size = p->hash_size;
++      m->snr4 = p->snr4; m->rssi = p->rssi; m->has_rf = 1;
++    }
++    break;
++  }
++  if (sig && roomLeft(key)) return;   // a room you left: it still pushes new posts (and the radio acknowledges them)
++  if (sig) contacts_dirty = true;     // the room's sync_since moved on: the contacts snapshot carries it
++  const char* who = c ? c->name : "?";
++  char au[9] = {0};
++  if (sig) {   // a room post: signed with the first 4 bytes of its author's key
++    memcpy(m->author, sig, 4); m->has_author = 1;
++    ContactInfo* a = mesh->lookupContactByPubKey(sig, 4);
++    if (a) who = a->name; else if (memcmp(sig, key, 4) == 0) who = c ? c->name : "room"; else { hexLower(au, sig, 4); who = au; }
++  }
++  strlcpy(m->sender, who, sizeof(m->sender));
++  strlcpy(m->text, text, sizeof(m->text));
++  persistMsg(m);
++  emitMsg(m);
++}
++
++void onChannelMsg(const uint8_t* f, size_t len, bool v3) {
++  size_t i = 1;
++  if (v3) i += 3;
++  if (len < i + 7) return;
++  uint8_t chan = f[i++], plen = f[i++];
++  i++;   // txt_type
++  uint32_t ts; memcpy(&ts, &f[i], 4); i += 4;
++  char full[MAX_TEXT + 40];
++  copyText(full, sizeof(full), &f[i], len - i);
++  const char* sep = strstr(full, ": ");
++  char sender[32] = {0};
++  const char* text = full;
++  if (sep && sep - full < 32) { memcpy(sender, full, sep - full); text = sep + 2; }
++  Lock l;
++  if (seenAlready(0, chan, nullptr, ts, text)) return;
++  Msg* m = newMsg();
++  m->ts = wallNow();
++  m->sender_ts = ts; m->kind = 0; m->chan = chan; m->dir = 0;
++  m->hops = plen == 255 ? -1 : (plen & 0x3F); m->hash_size = plen == 255 ? 1 : (plen >> 6) + 1;
++  m->status = ST_RECEIVED;
++  strlcpy(m->sender, sender, sizeof(m->sender));
++  strlcpy(m->text, text, sizeof(m->text));
++  uint32_t h = fnv(ts, full);   // route + signal from the RX log copy of this packet
++  for (int k = 0; k < RF_RING; k++) {
++    if (rf[k].h == h && rf[k].ts == ts) {
++      m->path_n = rf[k].path_n; memcpy(m->path, rf[k].path, rf[k].path_n);
++      m->hash_size = rf[k].hash_size; m->hops = rf[k].hops; m->snr4 = rf[k].snr4; m->rssi = rf[k].rssi; m->has_rf = 1; m->fp = rf[k].fp;
++      break;
++    }
++  }
++  persistMsg(m);
++  emitMsg(m);
++}
++
++// ---------------------------------------------------------------- listening to channels we haven't joined
++// A hashtag channel's key is derived from its name, so the radio can read any channel whose name
++// it knows, without using one of MeshCore's channel slots (and without being able to send there:
++// that needs joining). Names come from the user and from a list of channels known to be used in
++// Poland, tried against every channel packet we can't read. Unreadable channels (private ones,
++// unknown names) are only counted, by their 1-byte channel hash.
++const int MAX_WATCH = 48;
++void recordListened(const char* name, uint8_t* plain, int dl, uint8_t hops, uint8_t hs, const uint8_t* path, uint8_t path_n,
++                    int16_t snr4, int8_t rssi, uint32_t heard_at, uint32_t fp);   // below, next to onRxLog
++struct Watch { char name[32]; uint8_t secret[32]; uint8_t hash, used, found; uint32_t count, last; };
++struct ChanStat { uint32_t count, last; };
++struct Cand { uint8_t secret[32]; uint8_t hash; };
++Watch* watches = nullptr;            // PSRAM
++// The latest unreadable channel packets, so a name added later is checked at once (and its
++// messages shown), and so names can be searched for offline.
++const int MAX_SAMPLES = 128;
++struct Sample { uint32_t ts; int16_t snr4; int8_t rssi; uint8_t used, len, hops, hs, path_n, path[32], pay[184]; };
++Sample* samples = nullptr; int sample_head = 0;
++ChanStat* chan_stats = nullptr;      // [256], by channel hash
++Cand* cands = nullptr;
++// Seen on Polish lists (forum, MeshCore Polska, Wielkopolska) plus likely regional and topical names.
++const char* const CANDIDATES[] = {
++  "#polska", "#bot", "#tech", "#hamradio", "#info", "#pogoda", "#sos", "#emergency", "#pomoc", "#help", "#random",
++  "#offtopic", "#off-topic", "#chat", "#ping", "#echo", "#meshcore", "#mesh", "#lora", "#repeater", "#repeatery",
++  "#test2", "#testy", "#ds-test", "#bots", "#news", "#ogolny", "#general", "#lokalny", "#local", "#nocna", "#sp",
++  "#aprs", "#sar", "#osp", "#ratownictwo", "#gory", "#hiking", "#rower", "#drony", "#dev", "#firmware", "#solar",
++  "#antena", "#anteny", "#slask", "#slaskie", "#silesia", "#gornyslask", "#katowice", "#gliwice", "#zabrze",
++  "#bytom", "#sosnowiec", "#tychy", "#bielsko", "#rybnik", "#opole", "#opolskie", "#czestochowa", "#cz-wa", "#jura",
++  "#zawiercie", "#myszkow", "#lubliniec", "#klobuck", "#radomsko", "#krakow", "#malopolska", "#malopolskie",
++  "#tatry", "#zakopane", "#podhale", "#beskidy", "#tarnow", "#rzeszow", "#podkarpacie", "#kielce", "#swietokrzyskie",
++  "#lodz", "#lodzkie", "#warszawa", "#waw", "#mazowsze", "#mazowieckie", "#wroclaw", "#wroc-tech", "#legnica",
++  "#dolnoslaskie", "#wlkp", "#poznan", "#bydgoszcz", "#torun", "#kujawy", "#gdansk", "#trojmiasto", "#pomorze",
++  "#szczecin", "#zachod", "#wschod", "#poludnie", "#polnoc", "#lublin", "#lubelskie", "#bialystok", "#podlasie",
++  "#warmia", "#mazury", "#lubuskie", "#czechy", "#cz", "#sk", "#slovakia", "#ukraina", "#de",
++  "#testing", "#jokes", "#sports", "#pixels", "#weather", "#traffic", "#ham", "#memes", "#music", "#games",
++};
++const int CAND_COUNT = sizeof(CANDIDATES) / sizeof(CANDIDATES[0]);
++
++void hashtagKey(const char* name, uint8_t* secret, uint8_t& hash) {
++  uint8_t h[32];
++  memset(secret, 0, 32);
++  mesh::Utils::sha256(h, 32, (const uint8_t*)name, strlen(name));
++  memcpy(secret, h, 16);
++  mesh::Utils::sha256(h, 32, secret, 16);
++  hash = h[0];
++}
++bool validChannelName(const char* s) {
++  size_t n = strlen(s);
++  if (n < 2 || n > 31 || s[0] != '#') return false;
++  for (size_t i = 1; i < n; i++) if ((uint8_t)s[i] <= 0x20 || s[i] == '"' || s[i] == '\\' || s[i] == '/') return false;
++  return true;
++}
++Watch* findWatch(const char* name) {
++  for (int i = 0; i < MAX_WATCH; i++) if (watches[i].used && strcmp(watches[i].name, name) == 0) return &watches[i];
++  return nullptr;
++}
++void saveWatches() {
++  Buf b;
++  b.raw("[");
++  bool first = true;
++  for (int i = 0; i < MAX_WATCH; i++) {
++    if (!watches[i].used) continue;
++    b.raw(first ? "{\"n\":" : ",{\"n\":"); first = false;
++    b.str(watches[i].name);
++    b.f(",\"f\":%u}", watches[i].found);
++  }
++  b.raw("]\n");
++  File f = SPIFFS.open("/wu_watch.json", FILE_WRITE);
++  if (f) { f.write((const uint8_t*)b.p, b.n); f.close(); }
++}
++Watch* addWatch(const char* name, bool found) {   // under Lock
++  Watch* w = findWatch(name);
++  if (w) return w;
++  for (int i = 0; i < chan_count; i++) if (strcmp(chans[i].name, name) == 0) return nullptr;   // already joined
++  for (int i = 0; i < MAX_WATCH && !w; i++) if (!watches[i].used) w = &watches[i];
++  if (!w) return nullptr;
++  memset(w, 0, sizeof(*w));
++  strlcpy(w->name, name, sizeof(w->name));
++  hashtagKey(w->name, w->secret, w->hash);
++  w->used = 1; w->found = found;
++  return w;
++}
++void loadWatches() {
++  watches = (Watch*)palloc(sizeof(Watch) * MAX_WATCH);
++  chan_stats = (ChanStat*)palloc(sizeof(ChanStat) * 256);
++  cands = (Cand*)palloc(sizeof(Cand) * CAND_COUNT);
++  samples = (Sample*)palloc(sizeof(Sample) * MAX_SAMPLES);
++  for (int i = 0; i < CAND_COUNT; i++) hashtagKey(CANDIDATES[i], cands[i].secret, cands[i].hash);
++  // open() of a missing file still returns a usable-looking handle on this core: check first
++  if (!SPIFFS.exists("/wu_watch.json")) { addWatch("#polska", false); addWatch("#bot", false); saveWatches(); return; }   // national channels
++  File f = SPIFFS.open("/wu_watch.json");
++  if (!f) return;
++  JsonDocument doc;
++  if (!deserializeJson(doc, f)) for (JsonObject o : doc.as<JsonArray>()) { const char* n = o["n"] | ""; if (validChannelName(n)) addWatch(n, o["f"] | 0); }
++  f.close();
++}
++void emitListening() { Buf b; b.raw("\"listening\""); broadcast("stale", b); }
++
++// A channel packet none of our joined channels could read (under Lock, in onRxLog).
++const char* tryListening(const uint8_t* pay, size_t plen, uint8_t* plain, int& dl, const Pkt* p) {
++  uint8_t h = pay[0];
++  for (int i = 0; i < MAX_WATCH; i++) {
++    Watch& w = watches[i];
++    if (!w.used || w.hash != h) continue;
++    dl = mesh::Utils::MACThenDecrypt(w.secret, plain, pay + 1, plen - 1);
++    if (dl > 5) { w.count++; w.last = wallNow(); return w.name; }
++  }
++  for (int i = 0; i < CAND_COUNT; i++) {   // a channel we didn't know about?
++    if (cands[i].hash != h) continue;
++    dl = mesh::Utils::MACThenDecrypt(cands[i].secret, plain, pay + 1, plen - 1);
++    if (dl <= 5) continue;
++    Watch* w = addWatch(CANDIDATES[i], true);
++    if (!w) return nullptr;
++    w->count = 1; w->last = wallNow();
++    saveWatches();
++    emitListening();
++    return w->name;
++  }
++  ChanStat& s = chan_stats[h];
++  s.count++; s.last = wallNow();
++  if (plen <= sizeof(Sample::pay)) {
++    Sample& x = samples[sample_head]; sample_head = (sample_head + 1) % MAX_SAMPLES;
++    x.used = 1; x.ts = p->ts; x.snr4 = p->snr4; x.rssi = p->rssi; x.len = plen; memcpy(x.pay, pay, plen);
++    x.hops = p->hops; x.hs = p->hash_size; x.path_n = p->path_n; memcpy(x.path, p->path, p->path_n);
++  }
++  return nullptr;
++}
++
++// A name was just added: read the stored packets it can decrypt (under Lock). Returns how many.
++int replaySamples(Watch* w) {
++  int n = 0;
++  for (int i = 0; i < MAX_SAMPLES; i++) {
++    Sample& x = samples[i];
++    if (!x.used || x.pay[0] != w->hash) continue;
++    uint8_t plain[MAX_FRAME_SIZE + 16];
++    int dl = mesh::Utils::MACThenDecrypt(w->secret, plain, x.pay + 1, x.len - 1);
++    if (dl <= 5) continue;
++    plain[dl < (int)sizeof(plain) ? dl : (int)sizeof(plain) - 1] = 0;
++    recordListened(w->name, plain, dl, x.hops, x.hs, x.path, x.path_n, x.snr4, x.rssi, x.ts, payloadFp(x.pay, x.len));
++    x.used = 0;
++    if (chan_stats[w->hash].count) chan_stats[w->hash].count--;
++    w->count++; if (x.ts > w->last) w->last = x.ts;
++    n++;
++  }
++  return n;
++}
++
++void recordListened(const char* name, uint8_t* plain, int dl, uint8_t hops, uint8_t hs, const uint8_t* path, uint8_t path_n,
++                    int16_t snr4, int8_t rssi, uint32_t heard_at, uint32_t fp) {
++  if (dl < 6) return;
++  uint32_t ts; memcpy(&ts, plain, 4);
++  char full[MAX_TEXT + 40];
++  copyText(full, sizeof(full), plain + 5, dl - 5);
++  const char* sep = strstr(full, ": ");
++  char sender[32] = {0};
++  const char* text = full;
++  if (sep && sep - full < 32) { memcpy(sender, full, sep - full); text = sep + 2; }
++  uint8_t key[32] = {0};
++  strlcpy((char*)key, name, sizeof(key));
++  if (seenAlready(2, 0, key, ts, text)) return;   // the same message via another repeater
++  Msg* m = newMsg();
++  m->ts = heard_at;
++  m->sender_ts = ts; m->kind = 2; m->dir = 0; memcpy(m->key, key, 32);
++  m->hops = hops; m->hash_size = hs; m->path_n = path_n; memcpy(m->path, path, path_n);
++  m->snr4 = snr4; m->rssi = rssi; m->has_rf = 1; m->fp = fp;
++  m->status = ST_RECEIVED;
++  strlcpy(m->sender, sender, sizeof(m->sender));
++  strlcpy(m->text, text, sizeof(m->text));
++  persistMsg(m);
++  emitMsg(m);
++}
++
++// One heard packet as JSON, for /api/packets and the live feed alike. "info" is itself JSON in a
++// string, as the Python server sends it.
++void pktJson(Buf& b, const Pkt* p) {
++  b.f("{\"id\":%u,\"ts\":%u,\"route\":\"%s\",\"type\":\"%s\",\"hops\":%u,\"path\":", p->id, p->ts, ROUTE_NAME[p->route], PKT_NAME[p->type], p->hops);
++  b.hex(p->path, p->path_n);
++  b.f(",\"hash_size\":%u,\"snr\":%.2f,\"rssi\":%d,\"info\":", p->hash_size, p->snr4 / 4.0, p->rssi);
++  Buf info;
++  if (p->type == 4) { info.raw("{\"name\":"); info.str(p->name); info.f(",\"node_type\":\"%s\",\"key\":\"%s\"}", TYPE_NAME[p->node_type <= 4 ? p->node_type : 0], p->key); }
++  else if (p->type == 5 && p->name[0]) { info.raw("{\"channel\":"); info.str(p->name); info.raw("}"); }
++  else if (p->type == 5) info.f("{\"channel_hash\":\"%s\"}", p->key);
++  else info.raw("{}");
++  b.str(info.p ? info.p : "{}");
++  b.raw("}");
++}
++
++void onRxLog(const uint8_t* f, size_t len) {
++  if (len < 5) return;
++  int16_t snr4 = (int8_t)f[1];
++  int8_t rssi = (int8_t)f[2];
++  const uint8_t* r = f + 3;
++  size_t n = len - 3, i = 1;
++  uint8_t route = r[0] & 3, type = (r[0] >> 2) & 0xF;
++  if (route == 0 || route == 3) i += 4;
++  if (i >= n) return;
++  uint8_t pl = r[i++];
++  uint8_t hs = (pl >> 6) + 1, hops = pl & 0x3F;
++  size_t pbytes = (size_t)hops * hs;
++  if (i + pbytes > n) return;
++  const uint8_t* path = &r[i];
++  i += pbytes;
++  const uint8_t* pay = &r[i];
++  size_t plen = n - i;
++
++  Lock l;
++  Pkt* p = &pkts[pkt_head];
++  memset(p, 0, sizeof(*p));
++  pkt_head = (pkt_head + 1) % MAX_PKTS;
++  if (pkt_count < MAX_PKTS) pkt_count++;
++  p->id = next_pkt_id++; p->ts = wallNow();
++  p->route = route; p->type = type; p->hops = hops; p->hash_size = hs;
++  p->path_n = pbytes > 32 ? 32 : pbytes; memcpy(p->path, path, p->path_n);
++  p->snr4 = snr4; p->rssi = rssi; p->net = curNet();
++  p->fp = payloadFp(pay, plen); p->ms = millis();
++  p->raw_len = n > sizeof(p->raw) ? sizeof(p->raw) : n; memcpy(p->raw, r, p->raw_len);
++
++  if (type == 4 && plen >= 101) {   // ADVERT: key, ts, sig, app data
++    const uint8_t* key = pay;
++    const uint8_t* app = pay + 100;
++    size_t alen = plen - 100, j = 1;
++    uint8_t flags = app[0];
++    int32_t lat = 0, lon = 0;
++    bool loc = false;
++    if ((flags & 0x10) && alen >= j + 8) { memcpy(&lat, &app[j], 4); memcpy(&lon, &app[j + 4], 4); j += 8; loc = lat || lon; }
++    if (flags & 0x20) j += 2;
++    if (flags & 0x40) j += 2;
++    char name[32] = {0};
++    if ((flags & 0x80) && alen > j) copyText(name, sizeof(name), &app[j], alen - j);
++    p->node_type = flags & 0x0F;
++    strlcpy(p->name, name, sizeof(p->name));
++    hexLower(p->key, key, 6);
++    Heard* hd = nullptr;
++    for (int k = 0; k < heard_count; k++) if (memcmp(heard[k].key, key, 32) == 0) { hd = &heard[k]; break; }
++    if (!hd) {
++      if (heard_count < MAX_HEARD) hd = &heard[heard_count++];
++      else { hd = &heard[0]; for (int k = 1; k < heard_count; k++) if (heard[k].last < hd->last) hd = &heard[k]; }
++      memset(hd, 0, sizeof(*hd));
++      memcpy(hd->key, key, 32);
++      hd->first = p->ts;
++    }
++    if (name[0]) strlcpy(hd->name, name, sizeof(hd->name));
++    hd->type = flags & 0x0F;
++    if (loc) { hd->lat = lat; hd->lon = lon; hd->has_loc = 1; }
++    hd->last = p->ts; hd->count++; hd->snr4 = snr4; hd->rssi = rssi; hd->hops = hops; hd->hash_size = hs; hd->net = curNet();
++    hd->path_n = p->path_n; memcpy(hd->path, p->path, p->path_n);
++    Buf b;
++    b.raw("{\"pubkey\":"); b.hex(hd->key, 32);
++    b.raw(",\"name\":"); b.str(hd->name);
++    b.f(",\"type\":%u,\"lat\":", hd->type);
++    if (hd->has_loc) b.f("%.6f,\"lon\":%.6f", hd->lat / 1e6, hd->lon / 1e6); else b.raw("null,\"lon\":null");
++    b.f(",\"first_heard\":%u,\"last_heard\":%u,\"snr\":%.2f,\"rssi\":%d,\"hops\":%u,\"path\":", hd->first, hd->last, hd->snr4 / 4.0, hd->rssi, hd->hops);
++    b.hex(hd->path, hd->path_n);
++    b.f(",\"hash_size\":%u,\"count\":%u}", hd->hash_size, hd->count);
++    broadcast("heard", b);
++  } else if (type == 5 && plen >= 3) {   // GRP_TXT: try our channels
++    snprintf(p->key, sizeof(p->key), "%02x", pay[0]);
++    for (int k = 0; k < chan_count; k++) {
++      if (chans[k].hash != pay[0]) continue;
++      uint8_t plain[MAX_FRAME_SIZE + 16];
++      int dl = mesh::Utils::MACThenDecrypt(chans[k].secret, plain, pay + 1, plen - 1);
++      if (dl <= 5) continue;
++      plain[dl < (int)sizeof(plain) ? dl : (int)sizeof(plain) - 1] = 0;
++      strlcpy(p->name, chans[k].name, sizeof(p->name));
++      uint32_t ts; memcpy(&ts, plain, 4);
++      const char* full = (const char*)&plain[5];
++      Rf& x = rf[rf_head]; rf_head = (rf_head + 1) % RF_RING;
++      x.h = fnv(ts, full); x.ts = ts; x.at = millis(); x.fp = p->fp; x.hops = hops; x.hash_size = hs; x.path_n = p->path_n;
++      memcpy(x.path, p->path, p->path_n); x.snr4 = snr4; x.rssi = rssi;
++      // one of ours coming back from a repeater?
++      for (int q = msg_count - 1, seen = 0; q >= 0 && seen < 50; q--, seen++) {
++        Msg* m = msgAt(q);
++        if (m->dir != 1 || m->kind != 0 || m->chan != chans[k].idx || m->sender_ts != ts) continue;
++        char mine[MAX_TEXT + 40];
++        snprintf(mine, sizeof(mine), "%s: %s", mesh->getNodePrefs()->node_name, m->text);
++        if (strcmp(mine, full) != 0) continue;
++        m->repeats++;
++        m->status = ST_REPEATED;
++        if (!m->fp) m->fp = p->fp;
++        if (!m->path_n) { m->path_n = p->path_n; memcpy(m->path, p->path, p->path_n); m->hash_size = hs; m->hops = hops; }
++        m->snr4 = snr4; m->rssi = rssi; m->has_rf = 1;
++        persistUpdate(m);
++        emitMsg(m);
++        break;
++      }
++      break;
++    }
++    if (!p->name[0]) {   // not one of ours: a channel we listen to, or one we can only count
++      uint8_t plain[MAX_FRAME_SIZE + 16];
++      int dl = 0;
++      const char* nm = tryListening(pay, plen, plain, dl, p);
++      if (nm) {
++        plain[dl < (int)sizeof(plain) ? dl : (int)sizeof(plain) - 1] = 0;
++        strlcpy(p->name, nm, sizeof(p->name));
++        recordListened(nm, plain, dl, p->hops, p->hash_size, p->path, p->path_n, snr4, rssi, p->ts, p->fp);
++      }
++    }
++  } else if (type == 2 && plen >= 4 && pay[1] == mesh->self_id.pub_key[0]) {   // TXT_MSG from us: one of our DMs, relayed
++    for (int q = msg_count - 1, seen = 0; q >= 0 && seen < 30; q--, seen++) {
++      Msg* m = msgAt(q);
++      if (m->dir != 1 || m->kind != 1 || m->fp || m->key[0] != pay[0] || p->ts - m->ts > 120) continue;
++      m->fp = p->fp;   // copies show who passed it on (an ACK still says whether it arrived)
++      break;
++    }
++  }
++  Buf b;
++  pktJson(b, p);
++  broadcast("packet", b);
++}
++
++// Already linked to a message? (two messages never share a packet)
++bool fpTaken(uint32_t fp) {
++  for (int q = msg_count - 1, seen = 0; q >= 0 && seen < 100; q--, seen++) if (msgAt(q)->fp == fp) return true;
++  return false;
++}
++
++void onSent(uint32_t id, const uint8_t* f, size_t len) {   // RESP_SENT for one of our DMs
++  if (len < 10) return;
++  Lock l;
++  Msg* m = findMsg(id);
++  if (!m) return;
++  uint32_t ack, timeout; memcpy(&ack, &f[2], 4); memcpy(&timeout, &f[6], 4);
++  uint8_t k = (m->attempts ? m->attempts - 1 : 0) % 3;
++  m->acks[k] = ack;
++  m->flood_mask = (m->flood_mask & ~(1 << k)) | (f[1] ? 1 << k : 0) | (0x10 << k);   // byte 1: sent by flood (no route)
++  m->retry_at = millis() + (timeout ? timeout * 6 / 5 : 15000);
++}
++
++void onAck(const uint8_t* f, size_t len) {
++  if (len < 5) return;
++  uint32_t code, trip = 0; memcpy(&code, &f[1], 4);
++  if (len >= 9) memcpy(&trip, &f[5], 4);   // the radio's own round trip: that try's send to this ACK
++  Lock l;
++  for (int i = msg_count - 1, n = 0; i >= 0 && n < 100; i--, n++) {
++    Msg* m = msgAt(i);
++    if (m->dir != 1 || m->kind != 1) continue;
++    for (int k = 0; k < 3; k++) {
++      if (!code || m->acks[k] != code) continue;
++      if (m->status != ST_DELIVERED) {
++        m->status = ST_DELIVERED; m->retry_at = 0; m->ack_try = k + 1; m->rtt_ms = trip;
++        persistUpdate(m); emitMsg(m);
++      }
++      return;
++    }
++  }
++}
++
++void onOkErr(Kind kind, uint32_t ctx, bool ok) {
++  if (kind == K_SEND_CH || kind == K_SEND_DM) {
++    Lock l;
++    Msg* m = findMsg(ctx);
++    if (!m) return;
++    if (!ok) { m->status = ST_FAILED; m->retry_at = 0; persistUpdate(m); emitMsg(m); return; }
++    if (kind == K_SEND_CH) {
++      if (m->status == ST_SENDING) m->status = ST_SENT;
++      if (m->status == ST_SENT) m->retry_at = millis() + CHAN_RETRY_WAIT * (m->attempts ? m->attempts : 1);
++      persistUpdate(m);
++      emitMsg(m);
++    }
++  } else if (kind == K_CHANNEL) { chans_dirty = true; contacts_dirty = true; }
++  else if (kind == K_RADIO && ok) {   // another network: its own channels, packets and heard nodes from now on
++    Lock l;
++    memset(chan_stats, 0, sizeof(ChanStat) * 256);
++    for (int i = 0; i < MAX_SAMPLES; i++) samples[i].used = 0;
++    for (int i = 0; i < MAX_WATCH; i++) { watches[i].count = 0; watches[i].last = 0; }
++    chans_dirty = true;
++    Buf b; b.raw("\"all\""); broadcast("stale", b);   // browsers reload everything
++  }
++  else if (kind == K_NAME || kind == K_CONTACT) { contacts_dirty = true; }
++  else if (kind == K_ADVERT && ok) { saveSmallState(); }
++}
++
++// ---------------------------------------------------------------- repeater queries
++// Log in (as a guest unless a password is given), ask for status and for the repeaters it hears,
++// log out: the same requests MeshChat's Python server makes. Replies take seconds, so this is a
++// small state machine in the main task; one query at a time. Results stay in RAM.
++const int MAX_LIVE = 8, MAX_NB = 48;
++struct Nb { uint8_t pk[4]; int32_t secs; int8_t snr4; };
++struct Live {
++  uint8_t key[32]; uint32_t ts;
++  uint8_t used, running, ok, login, perms, status_len, nb_n; int16_t nb_total;
++  uint8_t room, acl, fw; uint32_t srv_ts;   // a room server? the role, clock and firmware level its login reported
++  uint8_t status[64]; char error[128]; Nb nb[MAX_NB];
++};
++Live* lives = nullptr;
++enum QStep : uint8_t { Q_IDLE, Q_LOGIN, Q_STATUS, Q_NB };
++// flooded: this query already forgot the saved route and asked again by flood (once per query).
++// pwd: the login password, kept only while the query runs, for that retry
++struct Query { QStep step; Live* L; uint32_t deadline, tag; uint8_t pages, flooded; char pwd[16]; } qry = {};
++volatile bool query_busy = false;
++
++// ---- rooms: the room servers you've joined from here. Joining is a login (as a guest with no
++// password, if the room allows one) that also tells the room which posts you already have: it then
++// pushes you the newer ones, one at a time, and each new post as it arrives, for as long as your
++// radio acknowledges them (MeshCore has no "leave" message). Saved on flash.
++const int MAX_ROOMS = 24;
++const char* ROLE_NAME[] = {"guest", "read-only", "read-write", "admin"};
++struct Room { uint8_t key[32]; uint32_t joined, login_at, left_at; uint8_t used, left, role, admin; };
++Room rooms[MAX_ROOMS];
++
++Room* roomFind(const uint8_t* key) { for (int i = 0; i < MAX_ROOMS; i++) if (rooms[i].used && memcmp(rooms[i].key, key, 32) == 0) return &rooms[i]; return nullptr; }
++bool roomLeft(const uint8_t* key) { Room* r = roomFind(key); return r && r->left; }
++
++void saveRooms() {
++  JsonDocument doc;
++  JsonArray a = doc.to<JsonArray>();
++  for (int i = 0; i < MAX_ROOMS; i++) {
++    if (!rooms[i].used) continue;
++    char k[65]; hexLower(k, rooms[i].key, 32);
++    JsonObject o = a.add<JsonObject>();
++    o["k"] = k; o["j"] = rooms[i].joined; o["l"] = rooms[i].login_at; o["x"] = rooms[i].left_at;
++    o["q"] = rooms[i].left; o["r"] = rooms[i].role; o["a"] = rooms[i].admin;
++  }
++  File f = SPIFFS.open("/wu_rooms.json", FILE_WRITE);
++  if (f) { serializeJson(doc, f); f.close(); }
++}
++void loadRooms() {
++  File f = SPIFFS.open("/wu_rooms.json");
++  if (!f) return;
++  JsonDocument doc;
++  if (!deserializeJson(doc, f)) {
++    int n = 0;
++    for (JsonObject o : doc.as<JsonArray>()) {
++      if (n >= MAX_ROOMS) break;
++      Room& r = rooms[n];
++      if (!hexToBytes(o["k"] | "", r.key, 32)) continue;
++      r.used = 1; r.joined = o["j"] | 0u; r.login_at = o["l"] | 0u; r.left_at = o["x"] | 0u;
++      r.left = o["q"] | 0; r.role = o["r"] | 0xFF; r.admin = o["a"] | 0;
++      n++;
++    }
++  }
++  f.close();
++}
++void roomJoined(const Live* L) {   // main task, under the lock
++  Room* r = roomFind(L->key);
++  if (!r) {
++    for (int i = 0; i < MAX_ROOMS && !r; i++) if (!rooms[i].used) r = &rooms[i];
++    if (!r) { r = &rooms[0]; for (int i = 1; i < MAX_ROOMS; i++) if (rooms[i].login_at < r->login_at) r = &rooms[i]; }   // forget the oldest
++    memset(r, 0, sizeof(*r));
++    memcpy(r->key, L->key, 32); r->used = 1;
++  }
++  uint32_t now = wallNow();
++  if (!r->joined || r->left) r->joined = now;
++  r->login_at = now; r->left = 0; r->left_at = 0;
++  r->role = L->acl; r->admin = L->perms == 1;
++  saveRooms();
++}
++void roomsJson(Buf& b) {
++  b.raw("[");
++  bool first = true;
++  for (int i = 0; i < MAX_ROOMS; i++) {
++    const Room& r = rooms[i];
++    if (!r.used) continue;
++    char k[65]; hexLower(k, r.key, 32);
++    b.f("%s{\"key\":\"%s\",\"joined\":%u,\"login_at\":%u,\"left\":%s,\"left_at\":%u,\"role\":", first ? "" : ",", k, r.joined, r.login_at, r.left ? "true" : "false", r.left_at);
++    first = false;
++    if (r.role <= 3) b.f("\"%s\"", ROLE_NAME[r.role]); else b.raw("null");
++    b.f(",\"admin\":%s}", r.admin ? "true" : "false");
++  }
++  b.raw("]");
++}
++
++void liveJson(Buf& b, const Live* L) {
++  char k[65]; hexLower(k, L->key, 32);
++  b.f("{\"key\":\"%s\",\"ts\":%u,\"running\":%s,\"ok\":%s,", k, L->ts, L->running ? "true" : "false", L->ok ? "true" : "false");
++  if (L->error[0]) { b.raw("\"error\":"); b.str(L->error); b.raw(","); }
++  if (L->room) b.raw("\"room\":true,");
++  if (L->login) {
++    b.f("\"login\":{\"admin\":%s,\"permissions\":%u,\"role\":", L->perms == 1 ? "true" : "false", L->perms);
++    if (L->acl <= 3) b.f("\"%s\"", ROLE_NAME[L->acl]); else b.raw("null");
++    if (L->srv_ts) b.f(",\"server_time\":%u", L->srv_ts);
++    if (L->fw) b.f(",\"fw_level\":%u", L->fw);
++    b.raw("},");
++  } else b.raw("\"login\":null,");
++  if (L->status_len >= 48) {
++    const uint8_t* d = L->status;
++    auto u16 = [d](int o) { return (unsigned)(d[o] | d[o + 1] << 8); };
++    auto i16 = [d](int o) { return (int)(int16_t)(d[o] | d[o + 1] << 8); };
++    auto u32 = [d](int o) { uint32_t v; memcpy(&v, d + o, 4); return (unsigned long)v; };
++    b.f("\"status\":{\"bat\":%u,\"tx_queue_len\":%u,\"noise_floor\":%d,\"last_rssi\":%d,", u16(0), u16(2), i16(4), i16(6));
++    b.f("\"nb_recv\":%lu,\"nb_sent\":%lu,\"airtime\":%lu,\"uptime\":%lu,", u32(8), u32(12), u32(16), u32(20));
++    b.f("\"sent_flood\":%lu,\"sent_direct\":%lu,\"recv_flood\":%lu,\"recv_direct\":%lu,", u32(24), u32(28), u32(32), u32(36));
++    b.f("\"full_evts\":%u,\"last_snr\":%.2f,\"direct_dups\":%u,\"flood_dups\":%u", u16(40), i16(42) / 4.0, u16(44), u16(46));
++    // room servers: posts stored since it started, and posts pushed to members (repeaters put their RX airtime here)
++    if (L->room && L->status_len >= 52) b.f(",\"posted\":%u,\"post_pushes\":%u", u16(48), u16(50));
++    b.raw("},");
++  } else b.raw("\"status\":null,");
++  if (L->nb_total >= 0) {
++    b.raw("\"neighbours\":[");
++    for (int i = 0; i < L->nb_n; i++) {
++      char pk[9]; hexLower(pk, L->nb[i].pk, 4);
++      b.f("%s{\"pubkey\":\"%s\",\"secs_ago\":%d,\"snr\":%.2f}", i ? "," : "", pk, (int)L->nb[i].secs, L->nb[i].snr4 / 4.0);
++    }
++    b.f("],\"neighbours_total\":%d}", L->nb_total);
++  } else b.raw("\"neighbours\":null,\"neighbours_total\":null}");
++}
++
++void queryNext(uint8_t cmd) {   // status or neighbours request to qry.L
++  uint8_t f[1 + 32 + 11] = {cmd};
++  memcpy(&f[1], qry.L->key, 32);
++  size_t n = 33;
++  if (cmd == CMD_SEND_BINARY_REQ) {
++    uint16_t off = qry.L->nb_n; uint32_t r = esp_random();
++    uint8_t req[11] = {0x06 /* neighbours */, 0 /* version */, 255 /* count */, (uint8_t)off, (uint8_t)(off >> 8), 0 /* newest first */, 4 /* prefix bytes */};
++    memcpy(&req[7], &r, 4);
++    memcpy(&f[33], req, 11); n += 11;
++  }
++  qry.deadline = millis() + 10000;   // until the radio says it sent it
++  queueCmd(K_QUERY, 0, f, n);
++}
++
++void queryLogin() {   // log in to qry.L (as a guest with no password)
++  uint8_t f[1 + 32 + 16] = {CMD_SEND_LOGIN};
++  memcpy(&f[1], qry.L->key, 32);
++  size_t pn = strnlen(qry.pwd, 15); memcpy(&f[33], qry.pwd, pn);
++  qry.deadline = millis() + 10000;   // until the radio says it sent it
++  queueCmd(K_QUERY, 0, f, 33 + pn);
++  memset(f, 0, sizeof(f));
++}
++
++void queryDone(const char* error) {
++  Lock l;   // the web task reads lives[]
++  Live* L = qry.L;
++  memset(qry.pwd, 0, sizeof(qry.pwd));
++  // repeaters: log out again. Rooms: stay (that's what joining is); a logout only stops keep-alives
++  if (L->login && !L->room) { uint8_t f[33] = {CMD_LOGOUT}; memcpy(&f[1], L->key, 32); queueCmd(K_OTHER, 0, f, 33); }
++  L->ok = L->status_len >= 48 || L->nb_total >= 0 || (L->room && L->login);
++  if (error) strlcpy(L->error, error, sizeof(L->error));
++  else if (!L->ok) strlcpy(L->error, "Logged in, but the repeater didn't send its status or neighbours back in time.", sizeof(L->error));
++  if (L->room && L->login) { roomJoined(L); emitStale(); }
++  L->running = 0;
++  L->ts = wallNow();
++  qry.step = Q_IDLE; qry.L = nullptr; query_busy = false;
++  Buf b; liveJson(b, L); broadcast("live", b);
++}
++
++void queryStart(const uint8_t* key, const char* pwd) {
++  Lock l;   // the web task reads lives[]
++  Live* L = nullptr;
++  for (int i = 0; i < MAX_LIVE && !L; i++) if (lives[i].used && memcmp(lives[i].key, key, 32) == 0) L = &lives[i];
++  for (int i = 0; i < MAX_LIVE && !L; i++) if (!lives[i].used) L = &lives[i];
++  if (!L) { L = &lives[0]; for (int i = 1; i < MAX_LIVE; i++) if (lives[i].ts < L->ts) L = &lives[i]; }   // forget the oldest
++  memset(L, 0, sizeof(*L));
++  memcpy(L->key, key, 32); L->used = 1; L->running = 1; L->nb_total = -1; L->acl = 0xFF;
++  ContactInfo* c = mesh->lookupContactByPubKey(key, 32);
++  L->room = c && c->type == ADV_TYPE_ROOM;   // a room: logging in is joining (see roomJoined)
++  L->ts = wallNow();
++  qry.L = L; qry.step = Q_LOGIN; qry.pages = 0; qry.flooded = 0;
++  strlcpy(qry.pwd, pwd, sizeof(qry.pwd));
++  queryLogin();
++  Buf b; liveJson(b, L); broadcast("live", b);
++}
++
++void querySent(const uint8_t* f, size_t len) {   // RESP_SENT: the request went out, now wait for the reply
++  if (qry.step == Q_IDLE || len < 10) return;
++  uint32_t tag, est; memcpy(&tag, &f[2], 4); memcpy(&est, &f[6], 4);
++  qry.tag = tag;
++  uint32_t wait = est * 5 / 4;
++  if (wait < 8000) wait = 8000;
++  // a room that was just joined is busy pushing posts (one every second or two, each waiting for our
++  // receipt), and its status reply queues behind them
++  if (qry.L && qry.L->room && qry.step == Q_STATUS && wait < 25000) wait = 25000;
++  if (wait > 45000) wait = 45000;
++  qry.deadline = millis() + wait;
++}
++
++void queryErr(const uint8_t* f, size_t len) {
++  if (qry.step == Q_IDLE) return;
++  uint8_t code = len > 1 ? f[1] : 0;
++  queryDone(code == 2 ? "Your radio doesn't have this repeater as a contact yet, so it can't address it."
++                      : "The radio couldn't send the request right now. Try again in a minute.");
++}
++
++void queryPush(uint8_t code, const uint8_t* f, size_t len) {
++  if (qry.step == Q_IDLE) return;
++  Lock l;   // the web task reads lives[]
++  Live* L = qry.L;
++  if (qry.step == Q_LOGIN && (code == PUSH_LOGIN_OK || code == PUSH_LOGIN_FAIL) && len >= 8 && memcmp(&f[2], L->key, 6) == 0) {
++    if (code == PUSH_LOGIN_FAIL) { queryDone(L->room ? "Login refused by the room." : "Login refused: this repeater needs a password (or a different one)."); return; }
++    L->login = 1; L->perms = f[1];
++    if (len >= 12) memcpy(&L->srv_ts, &f[8], 4);   // newer firmware: its clock, your role, its firmware level
++    if (len >= 13) L->acl = f[12] & 3;
++    if (len >= 14) L->fw = f[13];
++    qry.step = Q_STATUS; queryNext(CMD_SEND_STATUS_REQ);
++  } else if (qry.step == Q_STATUS && code == PUSH_STATUS && len >= 8 && memcmp(&f[2], L->key, 6) == 0) {
++    L->status_len = len - 8 > sizeof(L->status) ? sizeof(L->status) : len - 8;
++    memcpy(L->status, &f[8], L->status_len);
++    if (L->room) queryDone(nullptr);   // room servers don't list neighbours
++    else { qry.step = Q_NB; queryNext(CMD_SEND_BINARY_REQ); }
++  } else if (qry.step == Q_NB && code == PUSH_STATUS && len >= 8 && memcmp(&f[2], L->key, 6) == 0) {
++    // the status answer, late: we'd already moved on to the neighbours. Keep it
++    L->status_len = len - 8 > sizeof(L->status) ? sizeof(L->status) : len - 8;
++    memcpy(L->status, &f[8], L->status_len);
++  } else if (qry.step == Q_NB && code == PUSH_BINARY && len >= 10 && memcmp(&f[2], &qry.tag, 4) == 0) {
++    const uint8_t* d = &f[6];
++    int total = (int16_t)(d[0] | d[1] << 8), n = (int16_t)(d[2] | d[3] << 8);
++    L->nb_total = total;
++    for (int i = 0; i < n && 4 + (i + 1) * 9 <= (int)len - 6; i++) {
++      if (L->nb_n >= MAX_NB) break;
++      const uint8_t* e = d + 4 + i * 9;
++      Nb& nb = L->nb[L->nb_n++];
++      memcpy(nb.pk, e, 4); memcpy(&nb.secs, e + 4, 4); nb.snr4 = (int8_t)e[8];
++    }
++    if (n > 0 && L->nb_n < total && L->nb_n < MAX_NB && ++qry.pages < 4) queryNext(CMD_SEND_BINARY_REQ);   // more pages
++    else queryDone(nullptr);
++  }
++}
++
++void queryTick() {
++  if (qry.step == Q_IDLE || (int32_t)(millis() - qry.deadline) < 0) return;
++  // No answer on the saved route: it may work one way only (the answer comes back through repeaters
++  // that don't hear each other well), or a repeater on it is gone. Forget it and ask again by flood,
++  // once per query, as a DM's last try does; the answer brings a fresh route. Not a room's status,
++  // which is only slow while the room pushes posts.
++  bool room_status = qry.L->room && qry.step == Q_STATUS;
++  ContactInfo* c = mesh->lookupContactByPubKey(qry.L->key, 32);
++  if (!qry.flooded && !room_status && c && c->out_path_len != OUT_PATH_UNKNOWN) {
++    qry.flooded = 1;
++    uint8_t f[33] = {CMD_RESET_PATH};
++    memcpy(&f[1], qry.L->key, 32);
++    queueCmd(K_OTHER, 0, f, 33);   // K_OTHER: the route history records it as reset by "retry"
++    if (qry.step == Q_LOGIN) queryLogin();
++    else queryNext(qry.step == Q_STATUS ? CMD_SEND_STATUS_REQ : CMD_SEND_BINARY_REQ);
++    return;
++  }
++  if (qry.step == Q_LOGIN) queryDone(qry.L->room ? "No answer from the room, on the saved route or by flood. It needs a password for you (a wrong one gets no reply), or the request or its answer was lost on the way. Try again in a minute."
++                                                 : "No login reply, on the saved route or by flood. It may need a password (a wrong one gets no reply), or the request or its answer was lost on the way. Try again in a minute.");
++  else if (qry.step == Q_STATUS && qry.L->room) queryDone(nullptr);   // joined; it just didn't send its status
++  else if (qry.step == Q_STATUS) { qry.step = Q_NB; queryNext(CMD_SEND_BINARY_REQ); }   // no status: still ask for neighbours
++  else queryDone(nullptr);
++}
++
++// ---------------------------------------------------------------- repeater admin: its command line
++// Logged in with the admin password, you can run a repeater's (or room server's) command line from
++// here: each command is a TXT_MSG of type CLI_DATA (no ACK), and the node answers with one of the same
++// type, up to about 160 characters. Commands and answers per node, in RAM (gone after a restart).
++// Passwords and keys in commands, and the "password now:" echo, are masked before they're kept.
++const int MAX_CLI_NODES = 4, MAX_CLI_LINES = 40, CLI_TEXT = 168;
++struct CliLine { uint32_t id, ts; uint8_t cmd, status; char text[CLI_TEXT]; };   // status (commands): 0 sending, 1 sent, 2 failed
++struct CliLog { uint8_t key[32]; uint8_t used; uint32_t touched; int head, count; CliLine lines[MAX_CLI_LINES]; };
++CliLog* clis = nullptr;
++uint32_t next_cli_id = 1;
++
++CliLog* cliFind(const uint8_t* key, size_t n) {
++  for (int i = 0; i < MAX_CLI_NODES; i++) if (clis[i].used && memcmp(clis[i].key, key, n) == 0) return &clis[i];
++  return nullptr;
++}
++CliLog* cliGet(const uint8_t* key) {   // find or make one; when full, forget the one untouched longest
++  CliLog* g = cliFind(key, 32);
++  if (g) return g;
++  for (int i = 0; i < MAX_CLI_NODES && !g; i++) if (!clis[i].used) g = &clis[i];
++  if (!g) { g = &clis[0]; for (int i = 1; i < MAX_CLI_NODES; i++) if ((int32_t)(clis[i].touched - g->touched) < 0) g = &clis[i]; }
++  memset(g, 0, sizeof(*g));
++  memcpy(g->key, key, 32); g->used = 1;
++  return g;
++}
++void cliMask(char* t) {   // passwords and keys never sit in the log
++  static const char* const secret[] = {"password now: ", "password ", "set guest.password ", "set prv.key ", "set bridge.secret "};   // "password now:" before "password "
++  for (const char* p : secret) {
++    size_t n = strlen(p);
++    if (strncmp(t, p, n) == 0 && t[n]) { strlcpy(t + n, "\u2022\u2022\u2022\u2022", CLI_TEXT - n); return; }
++  }
++}
++CliLine* cliAdd(CliLog* g, bool cmd, const char* text, size_t len) {
++  if (g->count == MAX_CLI_LINES) { g->head = (g->head + 1) % MAX_CLI_LINES; g->count--; }
++  CliLine& l = g->lines[(g->head + g->count++) % MAX_CLI_LINES];
++  l.id = next_cli_id++; l.ts = wallNow(); l.cmd = cmd; l.status = cmd ? 0 : 1;
++  copyText(l.text, sizeof(l.text), (const uint8_t*)text, len);
++  cliMask(l.text);
++  g->touched = millis();
++  return &l;
++}
++void cliLineJson(Buf& b, const CliLine& l) {
++  b.f("{\"id\":%u,\"ts\":%u,\"dir\":\"%s\",\"status\":\"%s\",\"text\":", l.id, l.ts, l.cmd ? "command" : "answer",
++      !l.cmd ? "received" : l.status == 0 ? "sending" : l.status == 1 ? "sent" : "failed");
++  b.str(l.text); b.raw("}");
++}
++void cliJson(Buf& b, const uint8_t* key) {   // web task, under the lock
++  char k[65]; hexLower(k, key, 32);
++  b.f("{\"key\":\"%s\",\"lines\":[", k);
++  CliLog* g = cliFind(key, 32);
++  for (int i = 0; g && i < g->count; i++) { if (i) b.raw(","); cliLineJson(b, g->lines[(g->head + i) % MAX_CLI_LINES]); }
++  b.raw("]}");
++}
++void cliEmit(const CliLog* g, const CliLine& l) {
++  char k[65]; hexLower(k, g->key, 32);
++  Buf b; b.f("{\"key\":\"%s\",\"line\":", k); cliLineJson(b, l); b.raw("}");
++  broadcast("cli", b);
++}
++void cliSend(const uint8_t* key, const char* text) {   // main task
++  Lock l;
++  CliLog* g = cliGet(key);
++  size_t tl = strnlen(text, 159);
++  CliLine* ln = cliAdd(g, true, text, tl);
++  if (!mesh->lookupContactByPubKey(key, 32)) { ln->status = 2; cliEmit(g, *ln); return; }
++  uint8_t f[1 + 1 + 1 + 4 + 6 + 160];
++  size_t i = 0;
++  f[i++] = CMD_SEND_TXT_MSG; f[i++] = 1;   // TXT_TYPE_CLI_DATA
++  f[i++] = 0;                              // attempt
++  uint32_t ts = now_s(); memcpy(&f[i], &ts, 4); i += 4;   // (the radio stamps commands with its own clock)
++  memcpy(&f[i], key, 6); i += 6;
++  memcpy(&f[i], text, tl); i += tl;
++  queueCmd(K_CLI, ln->id, f, i);
++  memset(f, 0, sizeof(f));
++  cliEmit(g, *ln);
++}
++void cliSent(uint32_t id, bool ok) {   // the radio sent the command (RESP_SENT) or couldn't (RESP_ERR)
++  Lock l;
++  for (int i = 0; i < MAX_CLI_NODES; i++) {
++    CliLog& g = clis[i];
++    for (int j = 0; g.used && j < g.count; j++) {
++      CliLine& ln = g.lines[(g.head + j) % MAX_CLI_LINES];
++      if (ln.id == id && ln.cmd) { ln.status = ok ? 1 : 2; cliEmit(&g, ln); return; }
++    }
++  }
++}
++void cliAnswer(const uint8_t* prefix, const uint8_t* text, size_t len) {   // a node's CLI_DATA answer
++  ContactInfo* c = mesh->lookupContactByPubKey(prefix, 6);
++  Lock l;
++  CliLog* g = c ? cliGet(c->id.pub_key) : cliFind(prefix, 6);
++  if (!g) return;
++  CliLine* ln = cliAdd(g, false, (const char*)text, len);
++  cliEmit(g, *ln);
++}
++
++// ---------------------------------------------------------------- saved routes: their history
++// MeshCore keeps one route per contact (in the contact record) and nothing about where it came
++// from. This keeps, per contact: when the route was learned and last confirmed, the one before it,
++// how often it changed, the PATH packet that brought it, and when it was last reset (and by whom).
++// RAM, saved to flash a few seconds after a change. Main task only (the web task reads the
++// contacts snapshot, which carries it).
++const int MAX_ROUTES = 96, ROUTE_BYTES = 24;   // 24 bytes: 8 hops of 3-byte IDs, 12 of 2, 24 of 1
++enum : uint8_t { RESET_NONE, RESET_YOU, RESET_RETRY, RESET_APP };
++const char* RESET_BY[] = {"", "you", "retry", "app"};
++struct RouteRec {
++  uint8_t key[8];
++  uint32_t learned, confirmed, prev_since, reset;   // wall times; 0 = not known
++  uint16_t learns, changes;
++  uint8_t len, path[ROUTE_BYTES];                   // as last learned (an out_path_len byte; 0xFF none)
++  uint8_t prev_len, prev[ROUTE_BYTES];              // the one before
++  uint8_t reset_by;
++  uint32_t pkt_id;                                  // the PATH packet that brought it (0: not in the log)
++  int16_t snr4; int8_t rssi; uint8_t in_len;        // its signal, and its own path length byte
++};
++RouteRec routes[MAX_ROUTES]; int route_count = 0;
++uint32_t routes_dirty_at = 0;
++const char* ROUTES_FILE = "/wu_routes.bin";
++const uint32_t ROUTES_MAGIC = 0x31525557;   // "WUR1"
++
++size_t routeBytes(uint8_t len) {
++  if (len == OUT_PATH_UNKNOWN) return 0;
++  size_t n = (size_t)(len & 63) * ((len >> 6) + 1);
++  return n > ROUTE_BYTES ? ROUTE_BYTES : n;
++}
++bool sameRoute(uint8_t la, const uint8_t* pa, uint8_t lb, const uint8_t* pb) { return la == lb && memcmp(pa, pb, routeBytes(la)) == 0; }
++RouteRec* routeFind(const uint8_t* key) {
++  for (int i = 0; i < route_count; i++) if (memcmp(routes[i].key, key, 8) == 0) return &routes[i];
++  return nullptr;
++}
++RouteRec* routeGet(const uint8_t* key) {   // find or make one; when full, forget the one untouched longest
++  RouteRec* r = routeFind(key);
++  if (r) return r;
++  auto touched = [](const RouteRec& x) { return std::max(x.confirmed, x.reset); };
++  if (route_count < MAX_ROUTES) r = &routes[route_count++];
++  else { r = &routes[0]; for (int i = 1; i < MAX_ROUTES; i++) if (touched(routes[i]) < touched(*r)) r = &routes[i]; }
++  memset(r, 0, sizeof(*r));
++  memcpy(r->key, key, 8);
++  r->len = r->prev_len = OUT_PATH_UNKNOWN;
++  return r;
++}
++void routesChanged() { routes_dirty_at = millis() | 1; }
++
++void loadRoutes() {
++  File f = SPIFFS.open(ROUTES_FILE);
++  if (!f) return;
++  uint32_t magic = 0; int32_t n = 0;
++  if (f.read((uint8_t*)&magic, 4) == 4 && magic == ROUTES_MAGIC && f.read((uint8_t*)&n, 4) == 4 && n >= 0 && n <= MAX_ROUTES &&
++      f.read((uint8_t*)routes, n * sizeof(RouteRec)) == n * sizeof(RouteRec)) route_count = n;
++  f.close();
++}
++void saveRoutes() {
++  File f = SPIFFS.open(ROUTES_FILE, FILE_WRITE);
++  if (!f) return;
++  int32_t n = route_count;
++  f.write((const uint8_t*)&ROUTES_MAGIC, 4); f.write((const uint8_t*)&n, 4);
++  f.write((const uint8_t*)routes, n * sizeof(RouteRec));
++  f.close();
++}
++
++// PUSH_PATH: the radio has just stored a route to this contact (a PATH packet: the answer to a flood)
++void routeLearned(const uint8_t* key) {
++  ContactInfo* c = mesh->lookupContactByPubKey(key, 32);
++  if (!c || c->out_path_len == OUT_PATH_UNKNOWN) return;
++  Lock l;   // the snapshot builder reads routes[] in this task, but messages are read under the lock
++  RouteRec* r = routeGet(key);
++  uint32_t now = wallNow();
++  if (sameRoute(r->len, r->path, c->out_path_len, c->out_path)) {   // the same one again
++    if (!r->learned) r->learned = now;
++    r->confirmed = now;
++  } else {
++    if (r->len != OUT_PATH_UNKNOWN) { r->prev_len = r->len; memcpy(r->prev, r->path, ROUTE_BYTES); r->prev_since = r->learned; }
++    // a change: it differs from the last route we knew (the one it replaces, or the one reset before it)
++    if (r->prev_len != OUT_PATH_UNKNOWN && !sameRoute(r->prev_len, r->prev, c->out_path_len, c->out_path)) r->changes++;
++    r->len = c->out_path_len; memset(r->path, 0, ROUTE_BYTES); memcpy(r->path, c->out_path, routeBytes(r->len));
++    r->learned = r->confirmed = now;
++  }
++  if (r->learns < 0xFFFF) r->learns++;
++  // the PATH packet itself: the RX log entry just before this
++  r->pkt_id = 0;
++  for (int q = 0; q < pkt_count && q < 16; q++) {
++    Pkt* p = &pkts[(pkt_head - 1 - q + MAX_PKTS) % MAX_PKTS];
++    if (millis() - p->ms > 3000) break;
++    if (p->type != 8) continue;
++    r->pkt_id = p->id; r->snr4 = p->snr4; r->rssi = p->rssi; r->in_len = ((p->hash_size - 1) << 6) | p->hops;
++    break;
++  }
++  routesChanged();
++}
++
++// CMD_RESET_PATH from us or another app, just before the radio forgets the route
++void routeReset(const uint8_t* key, uint8_t by) {
++  ContactInfo* c = mesh->lookupContactByPubKey(key, 32);
++  if (!c || c->out_path_len == OUT_PATH_UNKNOWN) return;
++  Lock l;
++  RouteRec* r = routeGet(key);
++  bool tracked = sameRoute(r->len, r->path, c->out_path_len, c->out_path);
++  r->prev_len = c->out_path_len; memset(r->prev, 0, ROUTE_BYTES); memcpy(r->prev, c->out_path, routeBytes(r->prev_len));
++  r->prev_since = tracked ? r->learned : 0;
++  r->len = OUT_PATH_UNKNOWN; memset(r->path, 0, ROUTE_BYTES);
++  r->learned = 0; r->pkt_id = 0;
++  r->reset = wallNow(); r->reset_by = by;
++  routesChanged();
++}
++
++// ,"route":{...} in a contact's JSON (none if we know nothing about it)
++void routeJson(Buf& b, const ContactInfo& c) {
++  RouteRec* r = routeFind(c.id.pub_key);
++  if (!r) return;
++  // what we recorded applies only if the radio still has that route (another app may have replaced it)
++  bool cur = c.out_path_len != OUT_PATH_UNKNOWN && sameRoute(r->len, r->path, c.out_path_len, c.out_path);
++  b.raw(",\"route\":{");
++  if (cur) b.f("\"learned\":%u,\"confirmed\":%u,", r->learned, r->confirmed); else b.raw("\"learned\":null,\"confirmed\":null,");
++  b.f("\"learns\":%u,\"changes\":%u,\"previous\":", r->learns, r->changes);
++  if (r->prev_len != OUT_PATH_UNKNOWN) {
++    b.f("{\"out_path_len\":%u,\"hash_mode\":%u,\"out_path\":", r->prev_len & 63, r->prev_len >> 6);
++    b.hex(r->prev, routeBytes(r->prev_len));
++    if (r->prev_since) b.f(",\"since\":%u}", r->prev_since); else b.raw(",\"since\":null}");
++  } else b.raw("null");
++  if (r->reset) b.f(",\"reset\":{\"at\":%u,\"by\":\"%s\"}", r->reset, RESET_BY[r->reset_by <= 3 ? r->reset_by : 0]); else b.raw(",\"reset\":null");
++  if (cur && r->pkt_id)
++    b.f(",\"via\":{\"pkt_id\":%u,\"snr\":%.2f,\"rssi\":%d,\"hops\":%u,\"hash_size\":%u}}", r->pkt_id, r->snr4 / 4.0, r->rssi, r->in_len & 63, (r->in_len >> 6) + 1);
++  else b.raw(",\"via\":null}");
++}
++
++void appDmSent(const uint8_t* f, size_t len);   // below, with the other-app hooks
++
++void onFrame(const uint8_t* f, size_t len) {
++  if (!len) return;
++  uint8_t code = f[0];
++  Kind kind = K_NONE; uint32_t ctx = 0;
++  if (code < 0x80 && awaiting != K_NONE) { kind = awaiting; ctx = awaiting_ctx; awaiting = K_NONE; }
++  switch (code) {
++    // PUSH_WAITING and RESP_*_MSG: another app fetching the offline queue. We recorded those
++    // messages when they were queued (onQueued), so there's nothing to do.
++    case RESP_SENT:
++      if (kind == K_SEND_DM) onSent(ctx, f, len);
++      else if (kind == K_QUERY) querySent(f, len);
++      else if (kind == K_CLI) cliSent(ctx, true);
++      else if (kind == K_NONE && app_dm) appDmSent(f, len);
++      break;
++    case RESP_OK: case RESP_ERR:
++      if (kind == K_QUERY) { if (code == RESP_ERR) queryErr(f, len); }
++      else if (kind == K_CLI) cliSent(ctx, code == RESP_OK);
++      else onOkErr(kind, ctx, code == RESP_OK);
++      break;
++    case PUSH_LOGIN_OK: case PUSH_LOGIN_FAIL: case PUSH_STATUS: case PUSH_BINARY: queryPush(code, f, len); break;
++    case PUSH_ACK: onAck(f, len); break;
++    case PUSH_RX_LOG: onRxLog(f, len); break;
++    case PUSH_PATH: if (len >= 33) routeLearned(&f[1]); contacts_dirty = true; break;
++    case PUSH_ADVERT: case PUSH_NEW_ADVERT: contacts_dirty = true; break;
++    default: break;
++  }
++}
++
++// ---------------------------------------------------------------- other apps (Bluetooth, WiFi, USB)
++void onQueuedFrame(const uint8_t* f, int len) {
++  if (len < 1) return;
++  if (f[0] == RESP_CONTACT_MSG_V3 || f[0] == RESP_CONTACT_MSG) onContactMsg(f, len, f[0] == RESP_CONTACT_MSG_V3);
++  else if (f[0] == RESP_CHANNEL_MSG_V3 || f[0] == RESP_CHANNEL_MSG) onChannelMsg(f, len, f[0] == RESP_CHANNEL_MSG_V3);
++}
++
++// Another app is sending a text message: record it like one of ours, without retries (the app
++// does its own). Our own sends are recognisable because we're waiting for their reply.
++void onAppSendCmd(const uint8_t* c, int len) {
++  if (c[0] == CMD_RESET_PATH && len >= 33) {   // ours (Reset path, or a DM's last try) or another app's
++    routeReset(&c[1], awaiting == K_CONTACT ? RESET_YOU : awaiting == K_OTHER ? RESET_RETRY : RESET_APP);
++    contacts_dirty = true;
++    return;
++  }
++  if (awaiting == K_SEND_CH || awaiting == K_SEND_DM) return;
++  NodePrefs* np = mesh->getNodePrefs();
++  uint32_t ts;
++  Lock l;
++  if (c[0] == CMD_SEND_CHANNEL_TXT_MSG && len > 7 && c[1] == 0) {
++    memcpy(&ts, &c[3], 4);
++    if (!chanByIdx(c[2])) return;
++    Msg* m = newMsg();
++    m->ts = wallNow();
++    m->sender_ts = ts; m->kind = 0; m->chan = c[2]; m->dir = 1;
++    m->status = ST_SENT; m->attempts = 1; m->hash_size = 1;
++    strlcpy(m->sender, np->node_name, sizeof(m->sender));
++    copyText(m->text, sizeof(m->text), &c[7], len - 7);
++    persistMsg(m);
++    emitMsg(m);
++  } else if (c[0] == CMD_SEND_TXT_MSG && len > 13 && c[1] == 0) {
++    uint8_t attempt = c[2];
++    memcpy(&ts, &c[3], 4);
++    ContactInfo* ct = mesh->lookupContactByPubKey(&c[7], 6);
++    if (!ct) return;
++    Msg* m = nullptr;
++    if (attempt) {   // the app retrying one it sent before: same timestamp
++      for (int i = msg_count - 1, n = 0; i >= 0 && n < 100 && !m; i--, n++) {
++        Msg* o = msgAt(i);
++        if (o->dir == 1 && o->kind == 1 && o->sender_ts == ts && memcmp(o->key, ct->id.pub_key, 32) == 0) m = o;
++      }
++    }
++    if (!m) {
++      m = newMsg();
++      m->ts = wallNow();
++      m->sender_ts = ts; m->kind = 1; m->dir = 1; memcpy(m->key, ct->id.pub_key, 32);
++      m->hash_size = 1;
++      strlcpy(m->sender, np->node_name, sizeof(m->sender));
++      copyText(m->text, sizeof(m->text), &c[13], len - 13);
++      persistMsg(m);
++    }
++    m->attempts = attempt + 1; m->status = ST_SENDING; m->retry_at = 0;
++    app_dm = m->id;
++    persistUpdate(m);
++    emitMsg(m);
++  }
++}
++
++void appDmSent(const uint8_t* f, size_t len) {   // RESP_SENT for another app's DM: keep its ACK code
++  uint32_t id = app_dm;
++  app_dm = 0;
++  if (len < 10) return;
++  Lock l;
++  Msg* m = findMsg(id);
++  if (!m) return;
++  uint32_t ack; memcpy(&ack, &f[2], 4);
++  uint8_t k = (m->attempts ? m->attempts - 1 : 0) % 3;
++  m->acks[k] = ack;
++  m->flood_mask = (m->flood_mask & ~(1 << k)) | (f[1] ? 1 << k : 0) | (0x10 << k);
++  m->status = ST_SENT;   // "sent" until the ACK arrives (onAck), retries are up to the app
++  persistUpdate(m);
++  emitMsg(m);
++}
++
++// ---------------------------------------------------------------- the built-in app link
++class AppLink : public BaseSerialInterface {
++  bool en = true;
++public:
++  void enable() override { en = true; }
++  void disable() override { en = false; }
++  bool isEnabled() const override { return en; }
++  bool isConnected() const override { return true; }   // always "connected": the radio keeps logging for us
++  bool isWriteBusy() const override { return false; }
++  size_t writeFrame(const uint8_t src[], size_t len) override { onFrame(src, len); return len; }
++  size_t checkRecvFrame(uint8_t dest[]) override {
++    if (cmds.empty() || awaiting != K_NONE) return 0;   // one at a time: the next frame written is our reply
++    Cmd& c = cmds.front();
++    memcpy(dest, c.buf, c.len);
++    size_t n = c.len;
++    awaiting = c.kind == K_NONE ? K_OTHER : c.kind;
++    awaiting_ctx = c.ctx;
++    awaiting_since = millis();
++    cmds.pop_front();
++    return n;
++  }
++};
++AppLink app_link;
++
++// ---------------------------------------------------------------- snapshots for the web task
++void rebuildContacts() {
++  Buf b;
++  b.raw("{");
++  // The iterator skips MeshCore's 8 reserved slots for transient contacts at the start of the
++  // table. (getNumContacts() leaves them out but getContactByIdx() counts them, so looping over
++  // the two together listed those 8 slots and missed the last 8 real contacts.)
++  bool first = true;
++  ContactsIterator it = mesh->startContactsIterator();
++  ContactInfo c;
++  while (it.hasNext(mesh, c)) {
++    char k[65]; hexLower(k, c.id.pub_key, 32);
++    b.f("%s\"%s\":{\"pubkey\":\"%s\",\"name\":", first ? "" : ",", k, k);
++    first = false;
++    b.str(c.name);
++    b.f(",\"type\":\"%s\",\"lat\":", TYPE_NAME[c.type <= 4 ? c.type : 0]);
++    if (c.gps_lat || c.gps_lon) b.f("%.6f,\"lon\":%.6f", c.gps_lat / 1e6, c.gps_lon / 1e6); else b.raw("null,\"lon\":null");
++    // the saved route to them: hops in the low 6 bits, ID size - 1 in the top 2 (unknown: flood)
++    bool known = c.out_path_len != OUT_PATH_UNKNOWN;
++    uint8_t hops = known ? (c.out_path_len & 0x3F) : 0, mode = known ? (c.out_path_len >> 6) : 0;
++    size_t pbytes = (size_t)hops * (mode + 1);
++    b.f(",\"last_advert\":%u,\"out_path_len\":%d,\"hash_mode\":%u,\"out_path\":", c.last_advert_timestamp, known ? hops : -1, mode);
++    b.hex(c.out_path, pbytes <= sizeof(c.out_path) ? pbytes : sizeof(c.out_path));
++    routeJson(b, c);
++    if (c.type == 3) b.f(",\"sync_since\":%u", c.sync_since);   // rooms: posts up to this time are here
++    b.raw("}");
++  }
++  b.raw("}");
++  Lock l;
++  if (snap_contacts) free(snap_contacts);
++  snap_contacts = b.p; snap_contacts_len = b.n;
++  b.p = nullptr;
++  contacts_dirty = false;
++}
++
++// ---------------------------------------------------------------- public map (map.meshcore.io)
++// A browser can't load it (CORS only allows map.meshcore.dev, and it's 55 MB), so the radio fetches
++// it in a background task: stream the JSON one node at a time, keep the ones near home that were
++// seen recently, save that (tens of KB) to flash. Same filter as MeshChat's Python server.
++const char* PUBLIC_URL = "https://map.meshcore.io/api/v1/nodes?binary=0&short=1";
++const double PUBLIC_RADIUS_KM = 90;
++const uint32_t PUBLIC_MAX_AGE = 30 * 86400;
++const uint32_t PUBLIC_REFRESH_MS = 12UL * 3600 * 1000, PUBLIC_RETRY_MS = 30UL * 60 * 1000;
++const int MAX_PUBLIC = 800;
++char* snap_public = nullptr; size_t snap_public_len = 0;   // {"fetched":..,"nodes":[..]}, PSRAM
++uint32_t public_fetched = 0, public_next_ms = 90000, public_took_s = 0;
++volatile bool public_running = false;
++char public_error[96] = "";
++
++double kmBetween(double la1, double lo1, double la2, double lo2) {
++  const double r = 0.017453292519943295;
++  double a = 0.5 - cos((la2 - la1) * r) / 2 + cos(la1 * r) * cos(la2 * r) * (1 - cos((lo2 - lo1) * r)) / 2;
++  return 12742 * asin(sqrt(a));
++}
++
++uint32_t parseIso(const char* s) {   // "2026-10-17T21:28:21.000Z" -> unix seconds (UTC)
++  int y, mo, d, h, mi, se;
++  if (!s || sscanf(s, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) return 0;
++  y -= mo <= 2;
++  int era = (y >= 0 ? y : y - 399) / 400, yoe = y - era * 400;
++  int doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1, doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++  long days = (long)era * 146097 + doe - 719468;
++  return (uint32_t)(days * 86400 + h * 3600 + mi * 60 + se);
++}
++
++// The TLS client, read in chunks (byte-at-a-time TLS reads are slow).
++class Source {
++  Client& c;
++public:
++  size_t total = 0;
++  explicit Source(Client& client) : c(client) {}
++  int read(uint8_t* buf, int max) {   // > 0 bytes, or 0 at the end / after 20 s without data
++    uint32_t start = millis();
++    while (true) {
++      int k = c.read(buf, max);
++      if (k > 0) { total += k; return k; }
++      if (!c.connected() && c.available() <= 0) return 0;
++      if (millis() - start > 20000) return 0;
++      vTaskDelay(1);
++    }
++  }
++};
++
++// The body as a Stream for ArduinoJson: inflated from gzip with the ROM's tinfl into a 32 KB ring,
++// or passed through as is. gzip is a third of the size, and lwIP's 5.7 KB receive window makes
++// the transfer, not the parsing, the slow part.
++class BodyStream : public Stream {
++  Source& src; bool gz; uint8_t* in; uint8_t* dict; tinfl_decompressor* inf;
++  size_t in_i = 0, in_n = 0, out_i = 0, out_n = 0, dict_ofs = 0;
++  bool header = false, done = false;
++  static const size_t IN_SZ = 4096;
++  int inByte() {
++    if (in_i >= in_n) { in_n = src.read(in, IN_SZ); in_i = 0; if (!in_n) return -1; }
++    return in[in_i++];
++  }
++  bool skipGzipHeader() {
++    uint8_t h[10];
++    for (int i = 0; i < 10; i++) { int b = inByte(); if (b < 0) return false; h[i] = b; }
++    if (h[0] != 0x1f || h[1] != 0x8b || h[2] != 8) return false;
++    int b;
++    if (h[3] & 4) { int lo = inByte(), hi = inByte(); if (hi < 0) return false; for (int n = lo | hi << 8; n > 0; n--) if (inByte() < 0) return false; }
++    if (h[3] & 8) { while ((b = inByte()) > 0) {} if (b < 0) return false; }    // file name
++    if (h[3] & 16) { while ((b = inByte()) > 0) {} if (b < 0) return false; }   // comment
++    if (h[3] & 2) { inByte(); inByte(); }                                        // header CRC
++    return true;
++  }
++  bool more() {   // the next run of body bytes into [out_i, out_n)
++    if (done) return false;
++    if (!gz) {
++      int k = src.read(dict, TINFL_LZ_DICT_SIZE);
++      if (k <= 0) { done = true; return false; }
++      out_i = 0; out_n = k; inflated += k;
++      return true;
++    }
++    if (!header) { header = true; if (!skipGzipHeader()) { failed = done = true; return false; } }
++    while (true) {
++      if (in_i >= in_n) { in_n = src.read(in, IN_SZ); in_i = 0; }
++      size_t avail_in = in_n - in_i, avail_out = TINFL_LZ_DICT_SIZE - dict_ofs;
++      tinfl_status st = tinfl_decompress(inf, in + in_i, &avail_in, dict, dict + dict_ofs, &avail_out, in_n ? TINFL_FLAG_HAS_MORE_INPUT : 0);
++      in_i += avail_in;
++      if (avail_out) {
++        out_i = dict_ofs; out_n = dict_ofs + avail_out; inflated += avail_out;
++        dict_ofs = (dict_ofs + avail_out) & (TINFL_LZ_DICT_SIZE - 1);
++        if (st == TINFL_STATUS_DONE) done = true;
++        return true;
++      }
++      if (st == TINFL_STATUS_DONE) { done = true; return false; }
++      if (st < 0 || !in_n) { failed = done = true; return false; }   // corrupt or cut short
++    }
++  }
++public:
++  size_t inflated = 0; bool failed = false;
++  BodyStream(Source& s, bool gzip, uint8_t* inbuf, uint8_t* ring, tinfl_decompressor* d) : src(s), gz(gzip), in(inbuf), dict(ring), inf(d) {
++    tinfl_init(inf);
++    setTimeout(20000);
++  }
++  int available() override { return out_i < out_n ? out_n - out_i : done ? 0 : 1; }
++  int read() override { if (out_i >= out_n && !more()) return -1; return dict[out_i++]; }
++  int peek() override { if (out_i >= out_n && !more()) return -1; return dict[out_i]; }
++  size_t write(uint8_t) override { return 0; }
++};
++
++volatile uint32_t public_rx = 0, public_size = 0, public_seen = 0;   // progress, for the UI
++
++void publicTask(void*) {
++  uint32_t t0 = millis(), now = time(nullptr);
++  double hl, ho;
++  { Lock l; hl = home_lat; ho = home_lon; }
++  const char* err = nullptr;
++  int kept = 0, seen = 0;
++  Buf out;
++  uint8_t* inbuf = (uint8_t*)palloc(4096);
++  uint8_t* ring = (uint8_t*)palloc(TINFL_LZ_DICT_SIZE);
++  tinfl_decompressor* inf = (tinfl_decompressor*)palloc(sizeof(tinfl_decompressor));
++  WiFiClientSecure* tls = new WiFiClientSecure();
++  HTTPClient http;
++  public_rx = public_size = public_seen = 0;
++  tls->setCACert(ISRG_ROOT_X1);
++  http.useHTTP10(true);   // no chunked encoding
++  http.setTimeout(20000);
++  http.setUserAgent("meshchat-radio/0.1");
++  const char* want[] = {"Content-Encoding"};
++  http.collectHeaders(want, 1);
++  if (!inbuf || !ring || !inf || !http.begin(*tls, PUBLIC_URL)) err = "out of memory";
++  else {
++    http.addHeader("Accept-Encoding", "gzip");
++    int code = http.GET();
++    if (code != 200) { static char e[48]; snprintf(e, sizeof(e), "map.meshcore.io answered %d", code); err = code < 0 ? "couldn't connect to map.meshcore.io" : e; }
++    else {
++      public_size = http.getSize() > 0 ? http.getSize() : 0;
++      Source src(*http.getStreamPtr());
++      BodyStream in(src, http.header("Content-Encoding") == "gzip", inbuf, ring, inf);
++      JsonDocument filter;
++      for (const char* k : {"public_key", "type", "adv_name", "last_advert", "adv_lat", "adv_lon"}) filter[k] = true;
++      filter["params"] = true;
++      out.f("{\"fetched\":%u,\"nodes\":[", now);
++      if (!in.find("[")) err = "unexpected answer from map.meshcore.io";
++      else do {
++        JsonDocument d;
++        if (deserializeJson(d, in, DeserializationOption::Filter(filter))) { if (!seen) err = "couldn't read the map data"; break; }
++        seen++;
++        if ((seen & 127) == 0) { public_rx = src.total; public_seen = seen; vTaskDelay(1); }   // let the web server and WiFi breathe
++        if (d["adv_lat"].isNull() || d["adv_lon"].isNull()) continue;
++        double la = d["adv_lat"], lo = d["adv_lon"];
++        if (la == 0 && lo == 0) continue;
++        double km = kmBetween(hl, ho, la, lo);
++        uint32_t ts = parseIso(d["last_advert"] | "");
++        const char* pk = d["public_key"] | "";
++        if (km > PUBLIC_RADIUS_KM || ts + PUBLIC_MAX_AGE < now || strlen(pk) != 64 || kept >= MAX_PUBLIC) continue;
++        int t = d["type"] | 0;
++        out.f("%s{\"pubkey\":\"%s\",\"name\":", kept ? "," : "", pk);
++        out.str(d["adv_name"] | "");
++        out.f(",\"type\":\"%s\",\"lat\":%.5f,\"lon\":%.5f,\"last_advert\":%u,\"km\":%.1f,\"radio\":", TYPE_NAME[t >= 0 && t <= 4 ? t : 0], la, lo, ts, km);
++        JsonObject prm = d["params"];
++        if (prm.isNull()) out.raw("null");
++        else out.f("\"%g/%g/SF%d/CR%d\"", prm["freq"] | 0.0, prm["bw"] | 0.0, prm["sf"] | 0, prm["cr"] | 0);
++        out.raw("}");
++        kept++;
++      } while (in.findUntil(",", "]"));
++      out.raw("]}");
++      if (!err && in.failed) err = "the download was cut short";
++      public_rx = src.total; public_seen = seen;
++      log_i("public map: %d of %d nodes kept, %u bytes in, %u out, %lus", kept, seen, (unsigned)src.total, (unsigned)in.inflated, (millis() - t0) / 1000);
++    }
++  }
++  http.end();
++  delete tls;
++  free(inbuf); free(ring); free(inf);
++  if (!err && seen < 100) err = "the map data ended early";
++  if (!err && out.p) {
++    // SPIFFS is safe to use from two tasks. One big write straight from PSRAM writes nothing,
++    // so copy it through a small internal buffer.
++    File f = SPIFFS.open("/wu_public.json", FILE_WRITE);
++    size_t w = 0;
++    if (f) {
++      uint8_t tmp[1024];
++      while (w < out.n) {
++        size_t k = out.n - w < sizeof(tmp) ? out.n - w : sizeof(tmp);
++        memcpy(tmp, out.p + w, k);
++        if (f.write(tmp, k) != k) break;
++        w += k;
++      }
++      f.close();
++    }
++    Lock l;
++    if (w != out.n) snprintf(public_error, sizeof(public_error), "downloaded, but saving it failed (%u of %u bytes)", (unsigned)w, (unsigned)out.n);
++    if (snap_public) free(snap_public);
++    snap_public = out.p; snap_public_len = out.n; out.p = nullptr;
++    public_fetched = now;
++    if (w == out.n) public_error[0] = 0;
++    public_took_s = (millis() - t0) / 1000;
++    public_next_ms = millis() + PUBLIC_REFRESH_MS;
++  } else {
++    Lock l;
++    strlcpy(public_error, err ? err : "out of memory", sizeof(public_error));
++    public_next_ms = millis() + PUBLIC_RETRY_MS;
++  }
++  if (!err) { Buf b; b.raw("\"public\""); broadcast("stale", b); }
++  public_running = false;
++  vTaskDelete(nullptr);
++}
++
++void loadPublic() {
++  File f = SPIFFS.open("/wu_public.json");
++  if (!f) return;
++  size_t n = f.size();
++  char* p = n ? (char*)palloc(n + 1) : nullptr;
++  if (p && f.read((uint8_t*)p, n) == n) {
++    p[n] = 0;
++    unsigned fetched = 0;
++    if (sscanf(p, "{\"fetched\":%u", &fetched) == 1) { snap_public = p; snap_public_len = n; public_fetched = fetched; p = nullptr; }
++  }
++  free(p);
++  f.close();
++}
++
++void publicTick() {
++  if (public_running || (int32_t)(millis() - public_next_ms) < 0 || WiFi.status() != WL_CONNECTED || time(nullptr) < 1700000000) return;
++  uint32_t age = public_fetched ? time(nullptr) - public_fetched : UINT32_MAX;
++  if (age < PUBLIC_REFRESH_MS / 1000) { public_next_ms = millis() + (PUBLIC_REFRESH_MS / 1000 - age) * 1000; return; }   // the saved copy is fresh
++  // TLS needs ~45 KB of internal RAM; don't starve WiFi, Bluetooth and the web server for it
++  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 40000 || heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 60000) {
++    strlcpy(public_error, "not enough free memory right now", sizeof(public_error));
++    public_next_ms = millis() + PUBLIC_RETRY_MS;
++    return;
++  }
++  public_running = true;
++  if (xTaskCreatePinnedToCore(publicTask, "pubmap", 12288, nullptr, 1, nullptr, 0) != pdPASS) {
++    public_running = false;
++    strlcpy(public_error, "couldn't start the download", sizeof(public_error));
++    public_next_ms = millis() + PUBLIC_RETRY_MS;
++  }
++}
++
++// ---------------------------------------------------------------- web helpers
++bool hostAllowed(AsyncWebServerRequest* r) {
++  String h = r->host();
++  int c = h.indexOf(':');
++  if (c >= 0) h = h.substring(0, c);
++  h.toLowerCase();
++  if (h == WiFi.localIP().toString() || h == WiFi.softAPIP().toString()) return true;
++#ifdef WIFI_PORTAL
++  if (h.endsWith(".local") && wifinet::isOwnName(h.substring(0, h.length() - 6).c_str())) return true;   // incl. the built-in name
++#endif
++  return false;
++}
++// DNS-rebinding and CSRF protection, like MeshChat's Python server
++bool guard(AsyncWebServerRequest* r, bool write) {
++  if (!hostAllowed(r)) { r->send(403, "text/plain", "unexpected Host header"); return false; }
++  if (write && r->hasHeader("Origin")) {
++    String o = r->header("Origin");
++    if (o != "http://" + r->host()) { r->send(403, "text/plain", "cross-origin request refused"); return false; }
++  }
++  return true;
++}
++void sendBuf(AsyncWebServerRequest* r, std::shared_ptr<Buf> b, const char* type = "application/json") {
++  AsyncWebServerResponse* res = r->beginResponse(type, b->n, [b](uint8_t* out, size_t max, size_t index) -> size_t {
++    size_t n = b->n - index < max ? b->n - index : max;
++    memcpy(out, b->p + index, n);
++    return n;
++  });
++  res->addHeader("Cache-Control", "no-store");
++  r->send(res);
++}
++void queueAction(const Action& a) { Lock l; actions.push_back(a); }
++
++void stateJson(Buf& b) {
++  NodePrefs* np = mesh->getNodePrefs();
++  char pk[65]; hexLower(pk, mesh->self_id.pub_key, 32);
++  b.raw("{\"device\":true,\"connected\":true,\"port\":\"built-in\",");
++  b.raw("\"features\":{\"repeaters\":true,\"public_map\":true,\"transport\":false,\"ble_pin\":true,\"local_analysis\":true,\"listening\":true,\"networks\":true,\"add_contact\":true,\"ota\":true,\"rooms\":true,\"route_history\":true},");
++  b.raw("\"connection\":{\"transport\":\"device\",\"serial_port\":\"\",\"tcp_host\":\"\",\"tcp_port\":5000},");
++  b.raw("\"self\":{\"name\":"); b.str(np->node_name);
++  b.f(",\"pubkey\":\"%s\",\"tx_power\":%d,\"radio\":{\"freq\":%.3f,\"bw\":%g,\"sf\":%u,\"cr\":%u},", pk, np->tx_power_dbm, np->freq, np->bw, np->sf, np->cr);
++  b.f("\"fw\":\"%s-meshchat\",\"model\":\"%s\",\"path_hash_mode\":%u,\"loc_policy\":%u},", FIRMWARE_VERSION, board.getManufacturerName(), np->path_hash_mode, np->advert_loc_policy);
++  b.raw("\"channels\":[");
++  for (int i = 0; i < chan_count; i++) {
++    b.f("%s{\"idx\":%u,\"name\":", i ? "," : "", chans[i].idx);
++    b.str(chans[i].name);
++    b.f(",\"hash\":\"%02x\"}", chans[i].hash);
++  }
++  b.raw("],\"rooms\":");
++  roomsJson(b);
++  b.raw(",\"contacts\":");
++  if (snap_contacts) b.raw(snap_contacts, snap_contacts_len); else b.raw("{}");
++  b.raw(",\"heard\":{");
++  uint16_t net = curNet();
++  for (int i = 0, shown = 0; i < heard_count; i++) {
++    Heard& hd = heard[i];
++    if (hd.net != net) continue;   // heard on another network
++    char k[65]; hexLower(k, hd.key, 32);
++    b.f("%s\"%s\":{\"pubkey\":\"%s\",\"name\":", shown++ ? "," : "", k, k);
++    b.str(hd.name);
++    b.f(",\"type\":%u,\"lat\":", hd.type);
++    if (hd.has_loc) b.f("%.6f,\"lon\":%.6f", hd.lat / 1e6, hd.lon / 1e6); else b.raw("null,\"lon\":null");
++    b.f(",\"first_heard\":%u,\"last_heard\":%u,\"snr\":%.2f,\"rssi\":%d,\"hops\":%u,\"path\":", hd.first, hd.last, hd.snr4 / 4.0, hd.rssi, hd.hops);
++    b.hex(hd.path, hd.path_n);
++    b.f(",\"hash_size\":%u,\"count\":%u}", hd.hash_size, hd.count);
++  }
++  b.raw("},\"conversations\":{");
++  // newest message per conversation
++  bool first = true;
++  for (int i = msg_count - 1; i >= 0; i--) {
++    Msg* m = msgAt(i);
++    if (!visible(m)) continue;
++    bool later = false;
++    for (int j = i + 1; j < msg_count && !later; j++) if (sameConv(msgAt(j), m->kind, m->chan, m->key) && visible(msgAt(j))) later = true;
++    if (later) continue;
++    int n = 0;
++    for (int j = 0; j <= i; j++) if (sameConv(msgAt(j), m->kind, m->chan, m->key) && visible(msgAt(j))) n++;
++    b.raw(first ? "" : ","); first = false;
++    convId(b, m);
++    b.raw(":{\"conv\":"); convId(b, m);
++    b.f(",\"last_id\":%u,\"n\":%d,\"last_ts\":%u}", m->id, n, m->ts);
++  }
++  b.f("},\"home\":{\"lat\":%.6f,\"lon\":%.6f,\"label\":\"Home\"},", home_lat, home_lon);
++  if (advert_ts) { b.f("\"advertised\":{\"ts\":%u,\"flood\":%s,\"name\":", advert_ts, advert_flood ? "true" : "false"); b.str(advert_name); b.raw("},"); }
++  else b.raw("\"advertised\":null,");
++  b.f("\"limits\":{\"max_text_bytes\":%d,\"min_send_interval\":0,\"flood_advert_cooldown\":0,\"flood_advert_wait\":0}}", MAX_TEXT);
++}
++
++int parseConv(const String& conv, uint8_t& kind, uint8_t& chan, uint8_t* key) {
++  if (conv.startsWith("chan:")) { kind = 0; chan = conv.substring(5).toInt(); return chanByIdx(chan) ? 1 : 0; }
++  if (conv.startsWith("dm:") && conv.length() == 67) { kind = 1; return hexToBytes(conv.c_str() + 3, key, 32) ? 1 : 0; }
++  if (conv.startsWith("watch:") && conv.length() <= 6 + 31) { kind = 2; memset(key, 0, 32); strlcpy((char*)key, conv.c_str() + 6, 32); return 1; }
++  return 0;
++}
++
++void setupRoutes() {
++  DefaultHeaders::Instance().addHeader("Content-Security-Policy",
++    "default-src 'self'; img-src 'self' data: https://tile.openstreetmap.org; style-src 'self' 'unsafe-inline'; "
++    "font-src 'self' data:; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
++  DefaultHeaders::Instance().addHeader("X-Content-Type-Options", "nosniff");
++  DefaultHeaders::Instance().addHeader("Referrer-Policy", "strict-origin-when-cross-origin");
++
++  ws.setFilter([](AsyncWebServerRequest* r) {
++    if (!hostAllowed(r)) return false;
++    return !r->hasHeader("Origin") || r->header("Origin") == "http://" + r->host();
++  });
++  server.addHandler(&ws);
++
++  server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    auto b = std::make_shared<Buf>();
++    { Lock l; stateJson(*b); }
++    sendBuf(r, b);
++  });
++  server.on("/api/messages", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    uint8_t kind = 0, chan = 0, key[32] = {0};
++    String conv = r->hasParam("conv") ? r->getParam("conv")->value() : "";
++    auto b = std::make_shared<Buf>();
++    b->raw("[");
++    if (conv.startsWith("chan:") || conv.startsWith("dm:") || conv.startsWith("watch:")) {
++      if (conv.startsWith("chan:")) { kind = 0; chan = conv.substring(5).toInt(); }
++      else if (conv.startsWith("watch:")) { kind = 2; strlcpy((char*)key, conv.c_str() + 6, 32); }
++      else { kind = 1; hexToBytes(conv.c_str() + 3, key, 32); }
++      Lock l;
++      int start = 0, n = 0;
++      for (int i = msg_count - 1; i >= 0; i--) if (sameConv(msgAt(i), kind, chan, key) && visible(msgAt(i)) && ++n == 300) { start = i; break; }   // last 300
++      bool first = true;
++      for (int i = start; i < msg_count; i++) {
++        Msg* m = msgAt(i);
++        if (!sameConv(m, kind, chan, key) || !visible(m)) continue;
++        if (!first) b->raw(",");
++        first = false;
++        msgJson(*b, m);
++      }
++    }
++    b->raw("]");
++    sendBuf(r, b);
++  });
++  server.on("/api/packets", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    auto b = std::make_shared<Buf>();
++    int limit = r->hasParam("limit") ? r->getParam("limit")->value().toInt() : 300;
++    if (limit < 1 || limit > MAX_PKTS) limit = MAX_PKTS;
++    b->raw("[");
++    Lock l;
++    uint16_t net = curNet();
++    for (int i = 0, shown = 0; i < pkt_count && shown < limit; i++) {
++      Pkt* p = &pkts[(pkt_head - 1 - i + MAX_PKTS) % MAX_PKTS];
++      if (p->net != net) continue;   // another network's
++      if (shown++) b->raw(",");
++      pktJson(*b, p);
++    }
++    b->raw("]");
++    sendBuf(r, b);
++  });
++  // GET /api/message-info?id=N: everything known about one message, for its Details view. Every copy
++  // the radio heard (same payload fingerprint: one per route it came by, or per repeater that passed
++  // ours on), with signal and raw bytes; the channel and its key kind; what the sender's flags say.
++  // Copies come from the packet log, which is in RAM: only since the last restart.
++  server.on("/api/message-info", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    uint32_t id = r->hasParam("id") ? (uint32_t)r->getParam("id")->value().toInt() : 0;
++    auto b = std::make_shared<Buf>();
++    Lock l;
++    Msg* m = findMsg(id);
++    if (!m || m->deleted) { r->send(404, "text/plain", "no such message"); return; }
++    static const char* KIND[] = {"channel", "dm", "listened"};
++    b->f("{\"id\":%u,\"kind\":\"%s\",\"dir\":\"%s\",\"ts\":%u,\"sender_ts\":%u,\"status\":\"%s\",\"attempts\":%u,\"repeats\":%u,\"sender\":",
++         m->id, KIND[m->kind <= 2 ? m->kind : 0], m->dir ? "out" : "in", m->ts, m->sender_ts, ST_NAME[m->status], m->attempts, m->repeats);
++    b->str(m->sender);
++    b->raw(",\"text\":"); b->str(m->text);
++    b->f(",\"hops\":%d,\"hash_size\":%u,\"path\":", m->hops, m->hash_size);
++    b->hex(m->path, m->path_n);
++    b->f(",\"has_rf\":%s,\"snr\":%.2f,\"rssi\":%d", m->has_rf ? "true" : "false", m->snr4 / 4.0, m->rssi);
++    if (m->fp) b->f(",\"fp\":\"%08x\"", m->fp); else b->raw(",\"fp\":null");
++
++    // the channel, and its key, to read the sender's flags from a copy
++    uint8_t secret[32] = {0}; bool have_secret = false;
++    if (m->kind == 0 || m->kind == 2) {
++      char name[32] = {0}; uint8_t hash = 0;
++      if (m->kind == 0) {
++        for (int k = 0; k < chan_count; k++) if (chans[k].idx == m->chan) {
++          strlcpy(name, chans[k].name, sizeof(name)); hash = chans[k].hash; memcpy(secret, chans[k].secret, 32); have_secret = true;
++        }
++      } else {
++        strlcpy(name, (const char*)m->key, sizeof(name));
++        mesh::Utils::sha256(secret, 16, (const uint8_t*)name, strlen(name));   // hashtag channel: key = SHA-256(name)[:16]
++        uint8_t h[1]; mesh::Utils::sha256(h, 1, secret, 16); hash = h[0]; have_secret = true;
++      }
++      const char* kind = name[0] == '#' ? "hashtag" : strcmp(name, "Public") == 0 ? "public" : "private";
++      b->f(",\"channel\":{\"idx\":%d,\"hash\":\"%02x\",\"key\":\"%s\",\"name\":", m->kind == 0 ? m->chan : -1, hash, kind);
++      b->str(name); b->raw("}");
++    } else {
++      b->raw(",\"peer\":"); b->hex(m->key, 32);
++    }
++
++    // every copy heard, oldest first
++    b->raw(",\"copies\":[");
++    const Pkt* first = nullptr;
++    uint32_t oldest = 0;
++    for (int i = 0; i < pkt_count; i++) {
++      const Pkt* p = &pkts[(pkt_head - pkt_count + i + MAX_PKTS) % MAX_PKTS];
++      if (!oldest) oldest = p->ts;
++      if (!m->fp || p->fp != m->fp) continue;
++      if (!first) first = p;
++      b->f("%s{\"id\":%u,\"ts\":%u,\"after_ms\":%u,\"route\":\"%s\",\"type\":\"%s\",\"hops\":%u,\"hash_size\":%u,\"path\":",
++           p == first ? "" : ",", p->id, p->ts, p->ms - first->ms, ROUTE_NAME[p->route], PKT_NAME[p->type], p->hops, p->hash_size);
++      b->hex(p->path, p->path_n);
++      b->f(",\"snr\":%.2f,\"rssi\":%d,\"len\":%u,\"raw\":", p->snr4 / 4.0, p->rssi, p->raw_len);
++      b->hex(p->raw, p->raw_len);
++      b->raw("}");
++    }
++    b->f("],\"log_since\":%u", oldest);
++
++    // the sender's flags, from the first copy we can decrypt: message type and attempt number
++    if (first && have_secret && first->type == 5) {
++      size_t pn; const uint8_t* pay = rawPayload(first->raw, first->raw_len, pn);
++      uint8_t plain[MAX_FRAME_SIZE + 16];
++      int dl = pn > 3 ? mesh::Utils::MACThenDecrypt(secret, plain, pay + 1, (int)pn - 1) : 0;
++      if (dl > 5) b->f(",\"txt_type\":%u,\"attempt\":%u", plain[4] >> 2, plain[4] & 3);
++    }
++    b->raw("}");
++    sendBuf(r, b);
++  });
++  server.on("/api/people", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    auto b = std::make_shared<Buf>();
++    b->raw("[");
++    Lock l;
++    uint32_t since = wallNow() - 7 * 86400;
++    bool first = true;
++    for (int i = msg_count - 1; i >= 0; i--) {   // newest message per sender name
++      Msg* m = msgAt(i);
++      if (m->dir || m->kind || !m->sender[0] || m->ts < since || !visible(m)) continue;
++      bool later = false;
++      for (int j = i + 1; j < msg_count && !later; j++) { Msg* o = msgAt(j); if (!o->dir && !o->kind && visible(o) && strcmp(o->sender, m->sender) == 0) later = true; }
++      if (later) continue;
++      int n = 0; Msg* routed = nullptr; uint8_t convs[MAX_GROUP_CHANNELS] = {0};
++      for (int j = 0; j <= i; j++) {
++        Msg* o = msgAt(j);
++        if (o->dir || o->kind || o->ts < since || !visible(o) || strcmp(o->sender, m->sender)) continue;
++        n++; convs[o->chan % MAX_GROUP_CHANNELS] = 1;
++        if (o->has_rf) routed = o;
++      }
++      if (!first) b->raw(",");
++      first = false;
++      b->raw("{\"name\":"); b->str(m->sender);
++      b->f(",\"n\":%d,\"last_ts\":%u,\"last_conv\":\"chan:%u\",\"convs\":[", n, m->ts, m->chan);
++      bool fc = true;
++      for (int c = 0; c < MAX_GROUP_CHANNELS; c++) if (convs[c]) { b->f("%s\"chan:%d\"", fc ? "" : ",", c); fc = false; }
++      b->raw("],\"path\":");
++      if (routed) { b->hex(routed->path, routed->path_n); b->f(",\"hash_size\":%u,\"hops\":%d}", routed->hash_size, routed->hops); }
++      else b->raw("null,\"hash_size\":null,\"hops\":null}");
++    }
++    b->raw("]");
++    sendBuf(r, b);
++  });
++  server.on("/api/device/health", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    long pub_file = -1;
++    if (SPIFFS.exists("/wu_public.json")) { File f = SPIFFS.open("/wu_public.json"); pub_file = f.size(); f.close(); }
++    char out[400];
++    snprintf(out, sizeof(out), "{\"heap\":%u,\"heap_min\":%u,\"internal\":%u,\"internal_block\":%u,\"psram\":%u,\"psram_total\":%u,"
++             "\"messages\":%d,\"packets\":%d,\"public_nodes_bytes\":%u,\"public_file\":%ld,\"fs_used\":%u,\"fs_total\":%u,\"uptime_s\":%lu,\"reset_reason\":%d}",
++             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), (unsigned)ESP.getFreePsram(),
++             (unsigned)ESP.getPsramSize(), msg_count, pkt_count, (unsigned)snap_public_len, pub_file, (unsigned)SPIFFS.usedBytes(),
++             (unsigned)SPIFFS.totalBytes(), millis() / 1000, (int)esp_reset_reason());
++    r->send(200, "application/json", out);
++  });
++  server.on("/api/public-nodes", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    auto b = std::make_shared<Buf>();
++    {
++      Lock l;
++      if (snap_public && snap_public_len > 2) b->raw(snap_public, snap_public_len - 1);   // drop the closing brace
++      else b->f("{\"fetched\":%u,\"nodes\":[]", public_fetched);
++      b->f(",\"status\":{\"running\":%s,\"took_s\":%u,\"received\":%u,\"size\":%u,\"seen\":%u,\"error\":",
++           public_running ? "true" : "false", public_took_s, (unsigned)public_rx, (unsigned)public_size, (unsigned)public_seen);
++      if (public_error[0]) b->str(public_error); else b->raw("null");
++      b->raw("}}");
++    }
++    sendBuf(r, b);
++  });
++  server.on("/api/routes", HTTP_GET, [](AsyncWebServerRequest* r) {   // who sent channel messages through which repeaters
++    if (!guard(r, false)) return;
++    auto b = std::make_shared<Buf>();
++    b->raw("[");
++    Lock l;
++    bool first = true;
++    for (int i = 0; i < msg_count; i++) {
++      Msg* m = msgAt(i);
++      // channels we joined or listen to; ours too, with the route of the echo a repeater sent back
++      if (m->kind == 1 || !m->sender[0] || !m->path_n || !visible(m)) continue;
++      b->f("%s{\"id\":%u,\"ts\":%u,%s\"sender\":", first ? "" : ",", m->id, m->ts, m->dir ? "\"out\":true," : "");
++      first = false;
++      b->str(m->sender);
++      b->raw(",\"path\":"); b->hex(m->path, m->path_n);
++      b->f(",\"hash_size\":%u}", m->hash_size ? m->hash_size : 1);
++    }
++    b->raw("]");
++    sendBuf(r, b);
++  });
++  server.on("/api/repeaters/live", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    auto b = std::make_shared<Buf>();
++    b->raw("{");
++    Lock l;
++    bool first = true;
++    for (int i = 0; i < MAX_LIVE; i++) {
++      if (!lives[i].used) continue;
++      char k[65]; hexLower(k, lives[i].key, 32);
++      b->f("%s\"%s\":", first ? "" : ",", k);
++      first = false;
++      liveJson(*b, &lives[i]);
++    }
++    b->raw("}");
++    sendBuf(r, b);
++  });
++  server.on("/api/repeaters", HTTP_GET, [](AsyncWebServerRequest* r) {   // GET /api/repeaters/<key>/cli: commands sent from here, and answers
++    if (!guard(r, false)) return;
++    String u = r->url();
++    const size_t pre = strlen("/api/repeaters/");
++    uint8_t key[32];
++    if (!u.endsWith("/cli") || u.length() != pre + 64 + strlen("/cli") || !hexToBytes(u.substring(pre, pre + 64).c_str(), key, 32)) { r->send(404, "text/plain", "not found"); return; }
++    auto b = std::make_shared<Buf>();
++    { Lock l; cliJson(*b, key); }
++    sendBuf(r, b);
++  });
++  server.on("/api/device/wifi", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    NodePrefs* np = mesh->getNodePrefs();
++    auto b = std::make_shared<Buf>();
++#ifdef WIFI_PORTAL
++    b->f("{\"supported\":true,\"mode\":\"%s\",\"hostname\":\"%s\",\"default_hostname\":\"%s\",\"ssid\":", wifinet::modeName(), wifinet::hostname(), wifinet::defaultHostname());
++    if (np->wifi_ssid[0]) b->str(np->wifi_ssid); else b->raw("null");
++    if (WiFi.status() == WL_CONNECTED) b->f(",\"ip\":\"%s\",\"rssi\":%d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
++    else b->raw(",\"ip\":null,\"rssi\":null");
++    b->f(",\"password_set\":%s,\"ble_pin_set\":%s,\"connected_ssid\":", np->wifi_pwd[0] ? "true" : "false", np->ble_pin ? "true" : "false");
++    const char* cur = wifinet::connectedSsid();
++    if (cur[0]) b->str(cur); else b->raw("null");
++    b->raw(",\"networks\":[");   // names only: passwords never leave the radio
++    for (int i = 0; i < wifinet::networkCount(); i++) {
++      b->raw(i ? ",{\"ssid\":" : "{\"ssid\":");
++      b->str(wifinet::networkSsid(i));
++      b->f(",\"password_set\":%s,\"connected\":%s}", wifinet::networkHasPassword(i) ? "true" : "false",
++           cur[0] && strcmp(cur, wifinet::networkSsid(i)) == 0 ? "true" : "false");
++    }
++    b->raw("],\"max_networks\":8}");
++#else
++    b->raw("{\"supported\":false}");
++#endif
++    sendBuf(r, b);
++  });
++
++  auto json = [](const char* uri, std::function<void(AsyncWebServerRequest*, JsonObject)> fn) {
++    auto* h = new AsyncCallbackJsonWebHandler(uri, [fn](AsyncWebServerRequest* r, JsonVariant& v) {
++      if (!guard(r, true)) return;
++      if (!v.is<JsonObject>()) { r->send(400, "text/plain", "send a JSON object"); return; }
++      fn(r, v.as<JsonObject>());
++    });
++    h->setMethod(HTTP_POST);
++    server.addHandler(h);
++  };
++
++  json("/api/send", [](AsyncWebServerRequest* r, JsonObject o) {
++    String conv = o["conv"] | "";
++    String text = o["text"] | "";
++    text.trim();
++    for (size_t i = 0; i < text.length(); i++) if (text[i] == '\n' || text[i] == '\r') text.setCharAt(i, ' ');
++    uint8_t kind = 0, chan = 0, key[32] = {0};
++    if (!text.length()) { r->send(400, "text/plain", "empty message"); return; }
++    auto b = std::make_shared<Buf>();
++    {
++      Lock l;
++      if (!parseConv(conv, kind, chan, key)) { r->send(400, "text/plain", "unknown conversation"); return; }
++      if (kind == 2) { r->send(409, "text/plain", "You're only listening to this channel. Join it to send messages there."); return; }
++      NodePrefs* np = mesh->getNodePrefs();
++      size_t limit = MAX_TEXT - (kind == 0 ? strlen(np->node_name) + 2 : 0);
++      if (text.length() > limit) { r->send(400, "text/plain", "message too long"); return; }
++      Msg* m = newMsg();
++      m->ts = wallNow();
++      m->sender_ts = 0;   // stamped by the main task (MeshCore's clock isn't thread-safe)
++      m->kind = kind; m->chan = chan; memcpy(m->key, key, 32); m->dir = 1;
++      m->status = ST_SENDING; m->attempts = 1; m->hash_size = 1;
++      strlcpy(m->sender, np->node_name, sizeof(m->sender));
++      strlcpy(m->text, text.c_str(), sizeof(m->text));
++      Action a = {}; a.type = A_SEND; a.id = m->id;
++      actions.push_back(a);
++      msgJson(*b, m);
++    }
++    sendBuf(r, b);
++  });
++  server.on("/api/messages/*", HTTP_DELETE, [](AsyncWebServerRequest* r) {   // DELETE /api/messages/<id>
++    if (!guard(r, true)) return;
++    uint32_t id = r->url().substring(strlen("/api/messages/")).toInt();
++    {
++      Lock l;
++      Msg* m = findMsg(id);
++      if (!m || m->deleted) { r->send(404, "text/plain", "no such message"); return; }
++      m->deleted = 1;
++      Action a = {}; a.type = A_DELETE; a.id = id;
++      actions.push_back(a);
++    }
++    Buf b; b.raw("\"messages\""); broadcast("stale", b);
++    r->send(200, "application/json", "{\"ok\":true}");
++  });
++  server.on("/api/conversations/*", HTTP_DELETE, [](AsyncWebServerRequest* r) {   // DELETE /api/conversations/<conv>
++    if (!guard(r, true)) return;
++    String conv = r->url().substring(strlen("/api/conversations/"));
++    uint8_t kind = 0, chan = 0, key[32] = {0};
++    int n = 0;
++    {
++      Lock l;
++      if (!parseConv(conv, kind, chan, key)) { r->send(400, "text/plain", "unknown conversation"); return; }
++      uint32_t max_id = 0;
++      for (int i = 0; i < msg_count; i++) {
++        Msg* m = msgAt(i);
++        if (!sameConv(m, kind, chan, key) || !visible(m)) continue;
++        m->deleted = 1; n++;
++        if (m->id > max_id) max_id = m->id;
++      }
++      if (n) {
++        Action a = {}; a.type = A_DELETE_CONV; a.id = max_id; a.a = (kind << 8) | chan; memcpy(a.key, key, 32); a.net = curNet();
++        actions.push_back(a);
++      }
++    }
++    Buf b; b.raw("\"messages\""); broadcast("stale", b);
++    char out[48]; snprintf(out, sizeof(out), "{\"ok\":true,\"deleted\":%d}", n);
++    r->send(200, "application/json", out);
++  });
++  server.on("/api/messages/*", HTTP_POST, [](AsyncWebServerRequest* r) {   // /api/messages/<id>/resend
++    if (!guard(r, true)) return;
++    String u = r->url();
++    if (!u.endsWith("/resend")) { r->send(404, "text/plain", "not found"); return; }
++    uint32_t id = u.substring(strlen("/api/messages/"), u.length() - strlen("/resend")).toInt();
++    auto b = std::make_shared<Buf>();
++    {
++      Lock l;
++      Msg* m = findMsg(id);
++      if (!m || m->dir != 1 || m->kind != 0) { r->send(400, "text/plain", "only your own channel messages can be sent again"); return; }
++      if (m->status == ST_REPEATED) { r->send(409, "text/plain", "a repeater already passed this one on"); return; }
++      m->status = ST_SENDING; m->attempts++;
++      Action a = {}; a.type = A_RESEND; a.id = id;
++      actions.push_back(a);
++      msgJson(*b, m);
++    }
++    sendBuf(r, b);
++  });
++  json("/api/advert", [](AsyncWebServerRequest* r, JsonObject o) {
++    Action a = {}; a.type = A_ADVERT; a.a = (o["flood"] | false) ? 1 : 0;
++    queueAction(a);
++    r->send(200, "application/json", "{\"ok\":true}");
++  });
++  json("/api/name", [](AsyncWebServerRequest* r, JsonObject o) {
++    String n = o["name"] | "";
++    n.trim();
++    if (!n.length() || n.length() > 31) { r->send(400, "text/plain", "name must be 1-31 bytes"); return; }
++    Action a = {}; a.type = A_NAME; strlcpy(a.s1, n.c_str(), sizeof(a.s1));
++    queueAction(a);
++    auto b = std::make_shared<Buf>();
++    { Lock l; stateJson(*b); }
++    sendBuf(r, b);
++  });
++  // POST {public_key: 64 hex, name, type: 1 companion | 2 repeater | 3 room | 4 sensor}: a contact
++  // from a QR code or meshcore://contact/add link. One that's already a contact is left as it is
++  // (re-adding would forget the route the radio has learnt to it).
++  json("/api/contacts", [](AsyncWebServerRequest* r, JsonObject o) {
++    String u = r->url();
++    if (u != "/api/contacts") {   // POST /api/contacts/<key>/reset-path {}
++      const size_t pre = strlen("/api/contacts/");
++      Action a = {}; a.type = A_RESET_PATH;
++      if (!u.endsWith("/reset-path") || u.length() != pre + 64 + strlen("/reset-path") || !hexToBytes(u.substring(pre, pre + 64).c_str(), a.key, 32)) {
++        r->send(404, "text/plain", "not found"); return;
++      }
++      queueAction(a);
++      r->send(202, "application/json", "{\"ok\":true}");
++      return;
++    }
++    String key = o["public_key"] | "";
++    String name = o["name"] | "";
++    int type = o["type"] | 1;
++    key.toLowerCase(); name.trim();
++    Action a = {}; a.type = A_CONTACT_ADD; a.a = type;
++    if (!hexToBytes(key.c_str(), a.key, 32)) { r->send(400, "text/plain", "public_key must be 64 hex digits"); return; }
++    if (type < 1 || type > 4) { r->send(400, "text/plain", "type must be 1 (companion), 2 (repeater), 3 (room) or 4 (sensor)"); return; }
++    if (!name.length() || name.length() > 31) { r->send(400, "text/plain", "name must be 1-31 bytes"); return; }
++    {
++      Lock l;
++      String needle = "\"" + key + "\":";
++      if (snap_contacts && strstr(snap_contacts, needle.c_str())) { r->send(200, "application/json", "{\"exists\":true}"); return; }
++    }
++    strlcpy(a.s1, name.c_str(), sizeof(a.s1));
++    queueAction(a);
++    r->send(202, "application/json", "{\"added\":true}");
++  });
++  json("/api/channels", [](AsyncWebServerRequest* r, JsonObject o) {
++    String n = o["name"] | "";
++    String secret = o["secret"] | "";
++    n.trim();
++    if (!n.length() || n.length() > 31) { r->send(400, "text/plain", "channel name must be 1-31 bytes"); return; }
++    Action a = {}; a.type = A_CH_SET; strlcpy(a.s1, n.c_str(), sizeof(a.s1));
++    if (n[0] == '#' && !secret.length()) {
++      uint8_t key[32], hash;
++      hashtagKey(n.c_str(), key, hash);   // the key comes from the name
++      memcpy(a.secret, key, 16);
++    } else if (!hexToBytes(secret.c_str(), a.secret, 16)) {
++      r->send(400, "text/plain", "private channels need a 32-hex-digit secret; public ones start with #"); return;
++    }
++    {
++      Lock l;
++      for (int i = 0; i < chan_count; i++) if (strcmp(chans[i].name, a.s1) == 0) { r->send(409, "text/plain", "channel already exists"); return; }
++      int slot = -1;
++      for (int i = 1; i < MAX_GROUP_CHANNELS && slot < 0; i++) if (!chanByIdx(i)) slot = i;
++      if (slot < 0) { r->send(400, "text/plain", "no free channel slot"); return; }
++      a.a = slot;
++      actions.push_back(a);
++      ChanInfo& c = chans[chan_count++];   // optimistic: shown at once, confirmed by reloadChannels()
++      c.idx = slot; strlcpy(c.name, a.s1, sizeof(c.name)); memset(c.secret, 0, 32); memcpy(c.secret, a.secret, 16);
++      uint8_t hh[32]; mesh::Utils::sha256(hh, 32, a.secret, 16); c.hash = hh[0];
++      Watch* w = findWatch(a.s1);   // joined now: stop listening, its messages arrive as a channel of ours
++      if (w) { w->used = 0; saveWatches(); }
++    }
++    emitListening();
++    auto b = std::make_shared<Buf>();
++    { Lock l; stateJson(*b); }
++    sendBuf(r, b);
++  });
++  server.on("/api/channels/*", HTTP_DELETE, [](AsyncWebServerRequest* r) {
++    if (!guard(r, true)) return;
++    int idx = r->url().substring(strlen("/api/channels/")).toInt();
++    if (idx <= 0 || !chanByIdx(idx)) { r->send(400, "text/plain", "cannot remove that channel"); return; }
++    Action a = {}; a.type = A_CH_SET; a.a = idx; a.s1[0] = 0;
++    auto b = std::make_shared<Buf>();
++    {
++      Lock l;
++      actions.push_back(a);
++      for (int i = 0; i < chan_count; i++) if (chans[i].idx == idx) { chans[i] = chans[--chan_count]; break; }
++      stateJson(*b);
++    }
++    sendBuf(r, b);
++  });
++  json("/api/home", [](AsyncWebServerRequest* r, JsonObject o) {
++    double lat = o["lat"] | 999.0, lon = o["lon"] | 999.0;
++    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) { r->send(400, "text/plain", "bad coordinates"); return; }
++    Action a = {}; a.type = A_HOME; a.lat = lat; a.lon = lon;
++    queueAction(a);
++    char out[96]; snprintf(out, sizeof(out), "{\"lat\":%.6f,\"lon\":%.6f,\"label\":\"Home\"}", lat, lon);
++    r->send(200, "application/json", out);
++  });
++  json("/api/time", [](AsyncWebServerRequest* r, JsonObject o) {   // the browser's clock, if the radio's is behind
++    uint32_t t = o["now"] | 0u;
++    if (t > 1700000000) { Action a = {}; a.type = A_TIME; a.a = t; queueAction(a); }
++    r->send(200, "application/json", "{\"ok\":true}");
++  });
++  // registered before /api/listening: routes match by prefix and the first one registered wins
++  server.on("/api/listening/samples", HTTP_GET, [](AsyncWebServerRequest* r) {   // unreadable channel packets, raw
++    if (!guard(r, false)) return;
++    auto b = std::make_shared<Buf>();
++    b->raw("[");
++    Lock l;
++    bool first = true;
++    for (int i = 0; i < MAX_SAMPLES; i++) {
++      Sample& x = samples[i];
++      if (!x.used) continue;
++      b->f("%s{\"ts\":%u,\"hash\":\"%02x\",\"payload\":", first ? "" : ",", x.ts, x.pay[0]);
++      first = false;
++      b->hex(x.pay, x.len);
++      b->raw("}");
++    }
++    b->raw("]");
++    sendBuf(r, b);
++  });
++  server.on("/api/listening", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    auto b = std::make_shared<Buf>();
++    b->raw("{\"listening\":[");
++    Lock l;
++    bool first = true;
++    for (int i = 0; i < MAX_WATCH; i++) {
++      Watch& w = watches[i];
++      if (!w.used) continue;
++      b->raw(first ? "{\"name\":" : ",{\"name\":"); first = false;
++      b->str(w.name);
++      b->f(",\"hash\":\"%02x\",\"found\":%s,\"count\":%u,\"last\":%u}", w.hash, w.found ? "true" : "false", w.count, w.last);
++    }
++    b->raw("],\"unreadable\":[");
++    first = true;
++    for (int h = 0; h < 256; h++) {
++      if (!chan_stats[h].count) continue;
++      b->f("%s{\"hash\":\"%02x\",\"count\":%u,\"last\":%u}", first ? "" : ",", h, chan_stats[h].count, chan_stats[h].last);
++      first = false;
++    }
++    b->f("],\"since\":%u,\"max\":%d}", (unsigned)(time(nullptr) > 1700000000 ? time(nullptr) - millis() / 1000 : 0), MAX_WATCH);
++    sendBuf(r, b);
++  });
++  json("/api/listening", [](AsyncWebServerRequest* r, JsonObject o) {   // POST {name, remove?}
++    String n = o["name"] | "";
++    n.trim();
++    bool remove = o["remove"] | false;
++    if (!validChannelName(n.c_str())) { r->send(400, "text/plain", "Hashtag channel names start with # and have no spaces (up to 31 bytes)."); return; }
++    int matched = 0;
++    {
++      Lock l;
++      if (remove) { Watch* w = findWatch(n.c_str()); if (w) w->used = 0; }
++      else {
++        Watch* w = addWatch(n.c_str(), false);
++        if (!w) {
++          bool joined = false;
++          for (int i = 0; i < chan_count; i++) if (strcmp(chans[i].name, n.c_str()) == 0) joined = true;
++          r->send(409, "text/plain", joined ? "You've already joined that channel." : "The listening list is full."); return;
++        }
++        matched = replaySamples(w);
++      }
++      saveWatches();
++    }
++    emitListening();
++    char out[48]; snprintf(out, sizeof(out), "{\"ok\":true,\"matched\":%d}", matched);
++    r->send(200, "application/json", out);
++  });
++  json("/api/radio", [](AsyncWebServerRequest* r, JsonObject o) {   // POST {freq MHz, bw kHz, sf, cr}: switch network
++    double freq = o["freq"] | 0.0, bw = o["bw"] | 0.0;
++    int sf = o["sf"] | 0, cr = o["cr"] | 0;
++    // 863-870 MHz (EU SRD band) only, whole channel inside it; the radio's own limits for the rest
++    if (freq - bw / 2000 < 863.0 || freq + bw / 2000 > 870.0 || (bw != 62.5 && bw != 125 && bw != 250) || sf < 5 || sf > 12 || cr < 5 || cr > 8) {
++      r->send(400, "text/plain", "Use a channel inside 863-870 MHz, bandwidth 62.5, 125 or 250 kHz, SF5-12, CR 5-8."); return;
++    }
++    Action a = {}; a.type = A_RADIO; a.lat = freq; a.lon = bw; a.a = (sf << 8) | cr;
++    queueAction(a);
++    r->send(200, "application/json", "{\"ok\":true}");
++  });
++  json("/api/repeaters", [](AsyncWebServerRequest* r, JsonObject o) {   // POST /api/repeaters/<key>/query or /cli
++    String u = r->url();
++    const size_t pre = strlen("/api/repeaters/");
++    if (u.endsWith("/cli")) {   // {command}: run one of its CLI commands (needs an admin login)
++      Action a = {}; a.type = A_CLI;
++      if (u.length() != pre + 64 + strlen("/cli") || !hexToBytes(u.substring(pre, pre + 64).c_str(), a.key, 32)) { r->send(404, "text/plain", "not found"); return; }
++      String c = o["command"] | "";
++      c.trim();
++      if (c.isEmpty() || c.length() > 150 || c.indexOf('\n') >= 0) { r->send(400, "text/plain", "A command is one line, up to 150 characters."); return; }
++      strlcpy(a.text, c.c_str(), sizeof(a.text));
++      c = "";
++      queueAction(a);
++      memset(a.text, 0, sizeof(a.text));
++      r->send(202, "application/json", "{\"ok\":true}");
++      return;
++    }
++    Action a = {}; a.type = A_QUERY;
++    // the key is the 64 hex digits between the prefix and "/query" (hexToBytes wants exactly those)
++    if (!u.endsWith("/query") || u.length() != pre + 64 + strlen("/query") || !hexToBytes(u.substring(pre, pre + 64).c_str(), a.key, 32)) {
++      r->send(404, "text/plain", "not found"); return;
++    }
++    String pwd = o["password"] | "";
++    if (pwd.length() > 15) { r->send(400, "text/plain", "Repeater passwords are up to 15 characters."); return; }
++    if (query_busy) { r->send(409, "text/plain", "Another repeater query is still running. Try again when it's done."); return; }
++    query_busy = true;
++    strlcpy(a.s2, pwd.c_str(), sizeof(a.s2));
++    queueAction(a);
++    r->send(202, "application/json", "{\"started\":true}");
++  });
++  // POST /api/rooms/<key>/join {password?}: log in to a room server (a guest with no password, if it
++  // allows that); the result arrives as a "live" event, like a repeater query.
++  // POST /api/rooms/<key>/leave {}: stop showing its posts.
++  json("/api/rooms", [](AsyncWebServerRequest* r, JsonObject o) {
++    String u = r->url();
++    const size_t pre = strlen("/api/rooms/");
++    Action a = {};
++    bool join = u.endsWith("/join") && u.length() == pre + 64 + strlen("/join");
++    bool leave = u.endsWith("/leave") && u.length() == pre + 64 + strlen("/leave");
++    if ((!join && !leave) || !hexToBytes(u.substring(pre, pre + 64).c_str(), a.key, 32)) { r->send(404, "text/plain", "not found"); return; }
++    {
++      Lock l;
++      char k[65]; hexLower(k, a.key, 32);
++      String needle = String("\"") + k + "\":";
++      const char* at = snap_contacts ? strstr(snap_contacts, needle.c_str()) : nullptr;
++      const char* next = at ? strstr(at + needle.length(), "},\"") : nullptr;
++      const char* type = at ? strstr(at, "\"type\":\"") : nullptr;
++      if (!at || !type || (next && type > next) || strncmp(type + 8, "room\"", 5) != 0) {
++        r->send(404, "text/plain", "That isn't a room server in your contacts."); return;
++      }
++    }
++    if (leave) { a.type = A_ROOM_LEAVE; queueAction(a); r->send(202, "application/json", "{\"ok\":true}"); return; }
++    String pwd = o["password"] | "";
++    if (pwd.length() > 15) { r->send(400, "text/plain", "Room passwords are up to 15 characters."); return; }
++    if (query_busy) { r->send(409, "text/plain", "A repeater or room login is still running. Try again when it's done."); return; }
++    query_busy = true;
++    a.type = A_QUERY;
++    strlcpy(a.s2, pwd.c_str(), sizeof(a.s2));
++    queueAction(a);
++    pwd = "";
++    r->send(202, "application/json", "{\"started\":true}");
++  });
++  json("/api/device/wifi/hostname", [](AsyncWebServerRequest* r, JsonObject o) {
++    String h = o["hostname"] | "";
++    h.trim(); h.toLowerCase();
++#ifdef WIFI_PORTAL
++    if (!wifinet::validHostname(h.c_str())) { r->send(400, "text/plain", "Use lowercase letters, digits and dashes (up to 32), not starting or ending with a dash."); return; }
++#endif
++    Action a = {}; a.type = A_HOSTNAME; strlcpy(a.s1, h.c_str(), sizeof(a.s1));
++    queueAction(a);
++    char out[160]; snprintf(out, sizeof(out), "{\"supported\":true,\"mode\":\"connected\",\"hostname\":\"%s\"}", a.s1);
++    r->send(200, "application/json", out);
++  });
++  // POST /api/device/wifi/networks {ssid, password, connect} · …/networks/remove {ssid} · …/networks/prefer {ssid}
++  json("/api/device/wifi/networks", [](AsyncWebServerRequest* r, JsonObject o) {
++    String u = r->url(), ssid = o["ssid"] | "", pwd = o["password"] | "";
++    Action a = {};
++    if (!ssid.length() || ssid.length() > 32) { r->send(400, "text/plain", "Network names are 1-32 bytes."); return; }
++    strlcpy(a.s1, ssid.c_str(), sizeof(a.s1));
++    if (u.endsWith("/remove")) a.type = A_NET_REMOVE;
++    else if (u.endsWith("/prefer")) a.type = A_NET_PREFER;
++    else if (u == "/api/device/wifi/networks") {
++      if (pwd.length() && (pwd.length() < 8 || pwd.length() > 63)) { r->send(400, "text/plain", "WiFi passwords are 8 to 63 characters."); return; }
++      bool known = false;
++      for (int i = 0; i < wifinet::networkCount(); i++) if (ssid == wifinet::networkSsid(i)) known = true;
++      if (!known && wifinet::networkCount() >= 8) { r->send(409, "text/plain", "Eight networks are saved already. Remove one first."); return; }
++      a.type = A_NET_ADD; a.a = (o["connect"] | false) ? 1 : 0;
++      strlcpy(a.s2, pwd.c_str(), sizeof(a.s2));
++    } else { r->send(404, "text/plain", "not found"); return; }
++    queueAction(a);
++    r->send(200, "application/json", a.type == A_NET_ADD && a.a ? "{\"ok\":true,\"rebooting\":true}" : "{\"ok\":true}");
++  });
++  json("/api/device/wifi/join", [](AsyncWebServerRequest* r, JsonObject o) {
++    String ssid = o["ssid"] | "", pwd = o["password"] | "";
++    ssid.trim();
++    if (!ssid.length() || ssid.length() > 32) { r->send(400, "text/plain", "Network name must be 1-32 bytes."); return; }
++    if (pwd.length() && (pwd.length() < 8 || pwd.length() > 63)) { r->send(400, "text/plain", "WiFi passwords are 8 to 63 characters."); return; }
++    Action a = {}; a.type = A_JOIN; strlcpy(a.s1, ssid.c_str(), sizeof(a.s1)); strlcpy(a.s2, pwd.c_str(), sizeof(a.s2));
++    queueAction(a);
++    r->send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
++  });
++  json("/api/device/wifi/setup", [](AsyncWebServerRequest* r, JsonObject) {
++#ifdef WIFI_PORTAL
++    wifinet::requestSetup();
++#endif
++    r->send(200, "application/json", "{\"ok\":true}");
++  });
++  json("/api/device/ble-pin", [](AsyncWebServerRequest* r, JsonObject o) {
++    String pin = o["pin"] | "";
++    if (pin.length() != 6 || pin.toInt() < 100000) { r->send(400, "text/plain", "The Bluetooth PIN is 6 digits and can't start with 0."); return; }
++    Action a = {}; a.type = A_PIN; a.a = pin.toInt();
++    queueAction(a);
++    r->send(200, "application/json", "{\"ok\":true,\"note\":\"applies after the radio restarts\"}");
++  });
++  // GET /api/device/firmware: what's running, and where an update would go.
++  // POST /api/device/firmware (multipart, one .bin file): written into the spare app slot while the
++  // radio keeps working. At the end ESP-IDF checks the image (magic byte, chip, SHA-256 digest) and
++  // only then makes it the one to boot, so an interrupted or broken upload leaves the current
++  // firmware running. On success the radio restarts into it (contacts flushed first).
++  server.on("/api/device/firmware", HTTP_GET, [](AsyncWebServerRequest* r) {
++    if (!guard(r, false)) return;
++    const esp_partition_t* run = esp_ota_get_running_partition();
++    const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
++    auto b = std::make_shared<Buf>();
++    b->raw("{\"build\":"); b->str(MESHCHAT_BUILD + 15);
++    b->raw(",\"running\":"); b->str(run ? run->label : "?");
++    b->raw(",\"next\":"); b->str(next ? next->label : "?");
++    b->f(",\"slot_size\":%u,\"uploading\":%s,\"received\":%u}", next ? (unsigned)next->size : 0, ota.active ? "true" : "false", (unsigned)ota.bytes);
++    sendBuf(r, b);
++  });
++  server.on("/api/device/firmware", HTTP_POST,
++    [](AsyncWebServerRequest* r) {   // the whole body is in: report how it went
++      Ota done = ota; ota = {};
++      if (done.refused) { r->send(403, "text/plain", "refused: open the radio's own page to update it"); return; }
++      if (!done.ok) { r->send(400, "text/plain", done.error[0] ? done.error : "no firmware received"); return; }
++      char out[96]; snprintf(out, sizeof(out), "{\"ok\":true,\"bytes\":%u,\"ms\":%u}", (unsigned)done.bytes, (unsigned)(millis() - done.started));
++      r->send(200, "application/json", out);
++      Action a = {}; a.type = A_REBOOT; queueAction(a);
++    },
++    [](AsyncWebServerRequest* r, const String&, size_t index, uint8_t* data, size_t len, bool final) {
++      if (index == 0) {
++        ota = {};
++        // same rule as every other change: this page's own origin only (a website can't flash it)
++        if (!hostAllowed(r) || (r->hasHeader("Origin") && r->header("Origin") != "http://" + r->host())) { ota.refused = true; return; }
++        if (Update.isRunning()) Update.abort();
++        if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) { snprintf(ota.error, sizeof(ota.error), "couldn't start: %s", Update.errorString()); return; }
++        ota.active = true; ota.started = millis();
++      }
++      if (!ota.active) return;
++      if (len && Update.write(data, len) != len) {
++        snprintf(ota.error, sizeof(ota.error), "write failed at %u bytes: %s", (unsigned)ota.bytes, Update.errorString());
++        Update.abort(); ota.active = false; return;
++      }
++      ota.bytes += len;
++      if (final) {
++        ota.active = false;
++        if (Update.end(true)) ota.ok = true;   // verified, and set to boot next
++        else snprintf(ota.error, sizeof(ota.error), "Not installed: the file didn't check out (incomplete or damaged). The radio kept its firmware.");
++      }
++    });
++  json("/api/device/reboot", [](AsyncWebServerRequest* r, JsonObject) {
++    Action a = {}; a.type = A_REBOOT; queueAction(a);
++    r->send(200, "application/json", "{\"ok\":true}");
++  });
++
++  // WiFi setup page (on the hotspot, phones land here)
++#ifdef WIFI_PORTAL
++  server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* r) {
++    std::unique_ptr<char[]> page(new char[12000]);
++    wifinet::setupPage(page.get(), 12000, nullptr);
++    AsyncWebServerResponse* res = r->beginResponse(200, "text/html; charset=utf-8", String(page.get()));
++    res->addHeader("Cache-Control", "no-store");
++    r->send(res);
++  });
++  server.on("/wifi/rescan", HTTP_GET, [](AsyncWebServerRequest* r) { wifinet::rescan(); r->redirect("/wifi"); });
++  server.on("/wifi/save", HTTP_POST, [](AsyncWebServerRequest* r) {
++    if (r->hasHeader("Origin") && r->header("Origin") != "http://" + r->host()) { r->send(403, "text/plain", "cross-origin request refused"); return; }
++    String ssid = r->hasArg("ssid_manual") && r->arg("ssid_manual").length() ? r->arg("ssid_manual") : r->arg("ssid");
++    Action a = {}; a.type = A_JOIN;
++    strlcpy(a.s1, ssid.c_str(), sizeof(a.s1)); strlcpy(a.s2, r->arg("pwd").c_str(), sizeof(a.s2));
++    String h = r->arg("host"); h.trim(); h.toLowerCase();
++    if (h.length() && h != wifinet::hostname()) {
++      if (!wifinet::validHostname(h.c_str())) { r->send(400, "text/plain", "Hostname: lowercase letters, digits and dashes, up to 32."); return; }
++      Action hn = {}; hn.type = A_HOSTNAME; strlcpy(hn.s1, h.c_str(), sizeof(hn.s1)); queueAction(hn);
++    }
++    queueAction(a);
++    r->send(200, "text/html; charset=utf-8",
++      "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><body style='font:16px system-ui;padding:24px'>"
++      "<h1>Saved</h1><p>The radio restarts and joins your network. Reconnect this device to your usual WiFi, then open "
++      "<b>http://" + String(h.length() ? h : String(wifinet::hostname())) + ".local</b>.</p>");
++  });
++#endif
++
++  // the app itself: embedded, gzip-compressed, content-hashed assets
++  server.onNotFound([](AsyncWebServerRequest* r) {
++    String url = r->url();
++#ifdef WIFI_PORTAL
++    // Captive portal: a phone joining the hotspot opens this. First setup → the WiFi setup page.
++    // A home network is already saved (the radio is away from it) → MeshChat itself.
++    if (wifinet::inSetup() && !hostAllowed(r)) {
++      r->redirect("http://" + WiFi.softAPIP().toString() + (wifinet::hasSavedNetwork() ? "/" : "/wifi"));
++      return;
++    }
++#endif
++    if (!hostAllowed(r)) { r->send(403, "text/plain", "unexpected Host header"); return; }
++    if (url.startsWith("/api/") || url == "/ws") { r->send(404, "text/plain", "not found"); return; }
++    const WebAsset* a = nullptr;
++    for (size_t i = 0; i < WEB_ASSET_COUNT; i++) if (url == WEB_ASSETS[i].path) { a = &WEB_ASSETS[i]; break; }
++    if (!a && url.substring(url.lastIndexOf('/')).indexOf('.') >= 0) { r->send(404, "text/plain", "not found"); return; }   // a missing file
++    if (!a) a = &WEB_ASSETS[0];   // client-side routes (/c/..., /map, ...) load the app shell (index.html)
++    AsyncWebServerResponse* res = r->beginResponse(200, a->type, a->data, a->len);
++    res->addHeader("Content-Encoding", "gzip");
++    res->addHeader("Cache-Control", a->immutable ? "public, max-age=31536000, immutable" : "no-cache");
++    r->send(res);
++  });
++  server.begin();
++}
++
++}  // namespace
++
++void onQueued(const uint8_t* frame, int len) { if (mesh) onQueuedFrame(frame, len); }
++void onAppSend(const uint8_t* cmd, int len) { if (mesh) onAppSendCmd(cmd, len); }
++
++BaseSerialInterface* begin(MyMesh* m) {
++  mesh = m;
++  mtx = xSemaphoreCreateRecursiveMutex();
++  msgs = (Msg*)palloc(sizeof(Msg) * MAX_MSGS);
++  pkts = (Pkt*)palloc(sizeof(Pkt) * MAX_PKTS);
++  heard = (Heard*)palloc(sizeof(Heard) * MAX_HEARD);
++  lives = (Live*)palloc(sizeof(Live) * MAX_LIVE);
++  clis = (CliLog*)palloc(sizeof(CliLog) * MAX_CLI_NODES);
++  loadSmallState();
++  if (!legacy_net) { legacy_net = curNet(); saveSmallState(); }   // first start with networks: earlier history was on this one
++  loadPublic();
++  loadHistory();
++  loadRoutes();
++  loadRooms();
++  reloadChannels();
++  loadWatches();
++  uint8_t q[2] = {CMD_DEVICE_QUERY, 3};   // ask for v3 message frames (with SNR)
++  queueCmd(K_OTHER, 0, q, 2);
++  setupRoutes();
++  return &app_link;
++}
++
++void loop() {
++  uint32_t ms = millis();
++  if (awaiting != K_NONE && ms - awaiting_since > 3000) awaiting = K_NONE;   // never stall on a lost reply
++  if (restart_at && (int32_t)(ms - restart_at) > 0) { mesh->flushToFlash(); ESP.restart(); }
++
++  // actions from the web task
++  std::deque<Action> todo;
++  { Lock l; todo.swap(actions); }
++  for (Action& a : todo) {
++    switch (a.type) {
++      case A_SEND: case A_RESEND: {
++        Lock l;
++        Msg* m = findMsg(a.id);
++        if (!m) break;
++        if (a.type == A_SEND) { m->sender_ts = mesh->getRTCClock()->getCurrentTimeUnique(); persistMsg(m); }
++        else persistUpdate(m);
++        if (m->kind == 0) sendChan(m); else sendDm(m, false);
++        break;
++      }
++      case A_ADVERT: {
++        uint8_t f[2] = {CMD_SEND_SELF_ADVERT, (uint8_t)a.a};
++        queueCmd(K_ADVERT, 0, f, 2);
++        advert_ts = wallNow();
++        advert_flood = advert_flood || a.a;
++        strlcpy(advert_name, mesh->getNodePrefs()->node_name, sizeof(advert_name));
++        break;
++      }
++      case A_NAME: {
++        uint8_t f[33] = {CMD_SET_ADVERT_NAME};
++        size_t n = strlen(a.s1); memcpy(&f[1], a.s1, n);
++        queueCmd(K_NAME, 0, f, 1 + n);
++        break;
++      }
++      case A_CH_SET: {
++        uint8_t f[2 + 32 + 16] = {CMD_SET_CHANNEL, (uint8_t)a.a};
++        strncpy((char*)&f[2], a.s1, 32);
++        if (a.s1[0]) memcpy(&f[34], a.secret, 16);
++        queueCmd(K_CHANNEL, 0, f, sizeof(f));
++        break;
++      }
++      case A_RESET_PATH: {   // forget the saved route: the next message floods and learns a fresh one
++        uint8_t f[1 + 32] = {CMD_RESET_PATH};
++        memcpy(&f[1], a.key, 32);
++        queueCmd(K_CONTACT, 0, f, sizeof(f));
++        break;
++      }
++      case A_CONTACT_ADD: {   // the same command the MeshCore apps send for a scanned contact
++        // the whole record, position included (0, 0: none): for a new contact the radio starts from
++        // uninitialised memory, so a field left out of the frame comes out as garbage
++        uint8_t f[1 + 32 + 3 + MAX_PATH_SIZE + 32 + 4 + 8] = {CMD_ADD_UPDATE_CONTACT};
++        size_t i = 1;
++        memcpy(&f[i], a.key, 32); i += 32;
++        f[i++] = (uint8_t)a.a;           // type
++        f[i++] = 0;                      // flags
++        f[i++] = OUT_PATH_UNKNOWN;       // no route yet: flood until one is learnt
++        i += MAX_PATH_SIZE;
++        strncpy((char*)&f[i], a.s1, 32); i += 32;
++        // last advert 0 (we haven't heard one), then latitude and longitude 0: all still zero
++        queueCmd(K_CONTACT, 0, f, sizeof(f));
++        break;
++      }
++      case A_TIME: {
++        if ((uint32_t)a.a > now_s() + 5) { uint8_t f[5] = {CMD_SET_DEVICE_TIME}; memcpy(&f[1], &a.a, 4); queueCmd(K_OTHER, 0, f, 5); }
++        break;
++      }
++      case A_HOME: home_lat = a.lat; home_lon = a.lon; saveSmallState(); public_fetched = 0; public_next_ms = millis() + 5000; break;
++      case A_QUERY: queryStart(a.key, a.s2); memset(a.s2, 0, sizeof(a.s2)); break;
++      case A_CLI: cliSend(a.key, a.text); memset(a.text, 0, sizeof(a.text)); break;
++      case A_ROOM_LEAVE: {   // stop showing its posts; tell the radio to stop any keep-alives
++        Lock l;
++        Room* r = roomFind(a.key);
++        if (r && !r->left) { r->left = 1; r->left_at = wallNow(); saveRooms(); }
++        uint8_t f[33] = {CMD_LOGOUT}; memcpy(&f[1], a.key, 32); queueCmd(K_OTHER, 0, f, 33);
++        emitStale();
++        break;
++      }
++      case A_RADIO: {   // another network: MeshCore applies it at once and saves it
++        uint8_t f[11] = {CMD_SET_RADIO_PARAMS};
++        uint32_t khz = (uint32_t)(a.lat * 1000 + 0.5), hz = (uint32_t)(a.lon * 1000 + 0.5);
++        memcpy(&f[1], &khz, 4); memcpy(&f[5], &hz, 4); f[9] = (uint8_t)(a.a >> 8); f[10] = (uint8_t)a.a;
++        queueCmd(K_RADIO, 0, f, sizeof(f));
++        break;
++      }
++#ifdef WIFI_PORTAL
++      case A_HOSTNAME: {
++        NodePrefs* np = mesh->getNodePrefs();
++        strlcpy(np->wifi_hostname, a.s1, sizeof(np->wifi_hostname));
++        mesh->savePrefs();
++        wifinet::hostnameChanged();
++        break;
++      }
++      case A_JOIN: {
++        char err[96];
++        if (!wifinet::applySetup(a.s1, a.s2, "", err, sizeof(err))) { /* invalid input was rejected by the API already */ }
++        memset(a.s2, 0, sizeof(a.s2));
++        break;
++      }
++      case A_NET_ADD: {   // a = 1: make it preferred and restart to join it now
++        char err[96];
++        bool ok = wifinet::addNetwork(a.s1, a.s2, a.a != 0, err, sizeof(err));
++        memset(a.s2, 0, sizeof(a.s2));
++        if (ok && a.a) restart_at = millis() + 1500;
++        emitWifi();
++        break;
++      }
++      case A_NET_REMOVE: wifinet::removeNetwork(a.s1); emitWifi(); break;
++      case A_DELETE: persistDelete(a.id); break;
++      case A_DELETE_CONV: persistDeleteConv((uint8_t)(a.a >> 8), (uint8_t)a.a, a.key, a.net, a.id); break;
++      case A_NET_PREFER: wifinet::preferNetwork(a.s1); emitWifi(); break;
++#endif
++      case A_PIN: mesh->getNodePrefs()->ble_pin = a.a; mesh->savePrefs(); break;
++      case A_REBOOT: restart_at = millis() + 500; break;
++      default: break;
++    }
++  }
++
++  // retries
++  {
++    Lock l;
++    for (int i = msg_count - 1, n = 0; i >= 0 && n < 60; i--, n++) {
++      Msg* m = msgAt(i);
++      if (m->dir != 1 || !m->retry_at || (int32_t)(ms - m->retry_at) < 0) continue;
++      m->retry_at = 0;
++      if (m->kind == 1 && m->status == ST_SENDING) {          // DM without ACK: direct twice, then flood
++        if (m->attempts < 3) { m->attempts++; sendDm(m, m->attempts == 3); persistUpdate(m); emitMsg(m); }
++        else { m->status = ST_NO_ACK; persistUpdate(m); emitMsg(m); }
++      } else if (m->kind == 0 && m->status == ST_SENT) {      // nobody repeated it: send the identical packet again
++        if (m->attempts < 3) { m->attempts++; sendChan(m); persistUpdate(m); emitMsg(m); }
++        else { m->status = ST_NOT_HEARD; persistUpdate(m); emitMsg(m); }
++      }
++    }
++  }
++
++  queryTick();
++  publicTick();
++  if (routes_dirty_at && ms - routes_dirty_at > 5000) { routes_dirty_at = 0; saveRoutes(); }
++
++  // snapshots, clock, housekeeping
++  if (chans_dirty) { reloadChannels(); emitStale(); }
++  if ((contacts_dirty && ms - last_snapshot > 3000) || ms - last_snapshot > 120000 || !snap_contacts) {
++    last_snapshot = ms;
++    rebuildContacts();
++    emitStale();
++  }
++  if (!sntp_started && WiFi.status() == WL_CONNECTED) { configTime(0, 0, "pool.ntp.org", "time.google.com"); sntp_started = true; }
++  static uint32_t last_clock = 0;
++  if (ms - last_clock > 60000) {
++    last_clock = ms;
++    time_t t = time(nullptr);
++    if (t > 1700000000 && (uint32_t)t > now_s() + 5) { uint8_t f[5] = {CMD_SET_DEVICE_TIME}; uint32_t tt = t; memcpy(&f[1], &tt, 4); queueCmd(K_OTHER, 0, f, 5); }
++    ws.cleanupClients();
++  }
++}
++
++}  // namespace webui
++#endif
+diff --git a/examples/companion_radio/WebUi.h b/examples/companion_radio/WebUi.h
+new file mode 100644
+index 0000000..7a465cc
+--- /dev/null
++++ b/examples/companion_radio/WebUi.h
+@@ -0,0 +1,28 @@
++#pragma once
++// MeshChat on the radio itself (MeshChat addition, not upstream MeshCore).
++//
++// The web UI is a *built-in app*: it plugs into the interface manager like the USB/WiFi/BLE
++// links and speaks the normal companion protocol, so MeshCore handles sending, ACKs, saving and
++// adverts exactly as for any app. Every frame the firmware writes is broadcast to all links,
++// so other apps (USB, WiFi, Bluetooth) keep working alongside it and see the same messages.
++//
++// Incoming messages: MeshCore keeps them in its offline queue until an app fetches them. The web
++// UI records each one as it's queued (onQueued) and leaves the queue to the phone/desktop apps,
++// so they still get everything that arrived while they were away. Messages those apps send are
++// recorded too (onAppSend), so the web history has the whole conversation.
++//
++// Threads: the mesh, this module's loop() and the app link run in the Arduino main task.
++// HTTP/WebSocket handlers run in the async TCP task: they only read this module's own data
++// (behind a mutex) and queue actions that loop() performs.
++#ifdef WEB_UI
++#include <helpers/BaseSerialInterface.h>
++
++class MyMesh;
++
++namespace webui {
++  BaseSerialInterface* begin(MyMesh* mesh);   // returns the link to register with the interface manager
++  void loop();
++  void onQueued(const uint8_t* frame, int len);    // MyMesh::addToOfflineQueue
++  void onAppSend(const uint8_t* cmd, int len);     // MyMesh::handleCmdFrame, before a text send or a path reset
++}
++#endif
+diff --git a/examples/companion_radio/WifiPortal.cpp b/examples/companion_radio/WifiPortal.cpp
+new file mode 100644
+index 0000000..8fba80f
+--- /dev/null
++++ b/examples/companion_radio/WifiPortal.cpp
+@@ -0,0 +1,586 @@
++// See WifiPortal.h. MeshChat addition to the MeshCore companion firmware.
++#ifdef WIFI_PORTAL
++#include "WifiPortal.h"
++#include "NodePrefs.h"
++#include <Arduino.h>
++#include <DNSServer.h>
++#include <ESPmDNS.h>
++#include <mdns.h>
++#include <SPIFFS.h>
++#include <WebServer.h>
++#include <WiFi.h>
++
++namespace wifinet {
++namespace {
++
++const uint32_t JOIN_TIMEOUT = 45000;          // no IP this long after boot -> open the hotspot
++const uint32_t LOST_TIMEOUT = 10UL * 60000;   // network gone this long -> open the hotspot
++const uint32_t AUTO_SETUP_LIMIT = 10UL * 60000; // an automatic hotspot nobody uses closes and retries
++const uint32_t RETRY_EVERY = 15000;
++const uint32_t SETUP_RETRY_EVERY = 60000;      // with the hotspot up: try the saved network this often, when nobody's on it
++const char* AP_PASSWORD = "meshcore";         // WPA2 needs 8+ chars; documented in MeshChat's README
++
++enum Mode { OFF, STATION, SETUP };
++
++NodePrefs* prefs = nullptr;
++void (*save)() = nullptr;
++uint16_t port = 5000;
++char host[33] = {0};
++char default_host[33] = {0};   // built-in "meshcore-xxxx": always answered, so renaming never breaks bookmarks or the home-screen app
++char prev_host[33] = {0};      // the name before the last rename: answered until restart, so open pages keep working
++char ap_name[33] = {0};
++Mode mode = OFF;
++bool forced = false;           // opened by button/CLI: stays until settings are saved
++bool requested = false;
++bool ever_connected = false;
++// mDNS is started once per boot and never stopped. mdns_free() followed by mdns_init() (MDNS.end()
++// then MDNS.begin()) leaves the responder answering nothing, not even unicast queries, until the
++// next reboot: so a WiFi drop, a rename or the quick reconnect after a power-on used to kill
++// <hostname>.local. The mdns component follows WiFi up/down (and the hotspot) by itself; renames
++// change the name in place, and the aliases are re-pointed at our current addresses.
++bool mdns_up = false;
++char mdns_host[33] = {0};      // the name the responder currently answers as
++char aliases[2][33] = {{0}};   // delegated names currently registered
++uint32_t boot_ms = 0, setup_since = 0, last_retry = 0, lost_since = 0, restart_at = 0;
++volatile bool ev_got_ip = false, ev_lost = false;
++WebServer* web = nullptr;
++DNSServer* dns = nullptr;
++
++// ---- saved networks --------------------------------------------------------
++// Up to MAX_NETS, most preferred first, in their own file (one per line: hex(ssid) hex(password)).
++// The first is mirrored into MeshCore's prefs, so the wifi.ssid / wifi.pwd CLI keeps working.
++const int MAX_NETS = 8;
++const int MIN_RSSI = -85;   // weaker than this, a less preferred but stronger network wins
++const char* NETS_FILE = "/wifi_nets";
++struct Net { char ssid[33]; char pwd[64]; };
++Net nets[MAX_NETS];
++int net_count = 0, rr_next = 0;
++bool scan_to_join = false;
++
++bool haveSaved() { return net_count > 0; }
++
++int findNet(const char* ssid) {
++  for (int i = 0; i < net_count; i++) if (strcmp(nets[i].ssid, ssid) == 0) return i;
++  return -1;
++}
++
++void hexOut(File& f, const char* s) { for (const char* c = s; *c; c++) f.printf("%02x", (uint8_t)*c); }
++void hexIn(const String& h, char* out, size_t cap) {
++  size_t n = 0;
++  for (size_t i = 0; i + 1 < h.length() && n < cap - 1; i += 2) out[n++] = (char)strtol(h.substring(i, i + 2).c_str(), nullptr, 16);
++  out[n] = 0;
++}
++
++void saveNets() {
++  File f = SPIFFS.open(NETS_FILE, FILE_WRITE);
++  if (f) {
++    for (int i = 0; i < net_count; i++) { hexOut(f, nets[i].ssid); f.print(' '); hexOut(f, nets[i].pwd); f.print('\n'); }
++    f.close();
++  }
++  // mirror the preferred one into MeshCore's prefs
++  strncpy(prefs->wifi_ssid, net_count ? nets[0].ssid : "", sizeof(prefs->wifi_ssid) - 1);
++  strncpy(prefs->wifi_pwd, net_count ? nets[0].pwd : "", sizeof(prefs->wifi_pwd) - 1);
++  save();
++}
++
++void loadNets() {
++  net_count = 0;
++  if (SPIFFS.exists(NETS_FILE)) {
++    File f = SPIFFS.open(NETS_FILE);
++    while (f && f.available() && net_count < MAX_NETS) {
++      String line = f.readStringUntil('\n');
++      int sp = line.indexOf(' ');
++      if (sp <= 0) continue;
++      Net& n = nets[net_count];
++      hexIn(line.substring(0, sp), n.ssid, sizeof(n.ssid));
++      hexIn(line.substring(sp + 1), n.pwd, sizeof(n.pwd));
++      if (n.ssid[0]) net_count++;
++    }
++    if (f) f.close();
++  }
++  // a network set another way (CLI, older firmware) becomes the preferred one
++  if (prefs->wifi_ssid[0] && findNet(prefs->wifi_ssid) != 0) {
++    int i = findNet(prefs->wifi_ssid);
++    if (i < 0) i = net_count < MAX_NETS ? net_count++ : MAX_NETS - 1;
++    for (int k = i; k > 0; k--) nets[k] = nets[k - 1];
++    strncpy(nets[0].ssid, prefs->wifi_ssid, sizeof(nets[0].ssid) - 1); nets[0].ssid[32] = 0;
++    strncpy(nets[0].pwd, prefs->wifi_pwd, sizeof(nets[0].pwd) - 1); nets[0].pwd[63] = 0;
++    saveNets();
++  }
++}
++
++void macSuffix(char* out, size_t n, bool upper) {
++  uint8_t mac[6];
++  WiFi.macAddress(mac);
++  snprintf(out, n, upper ? "%02X%02X" : "%02x%02x", mac[4], mac[5]);
++}
++
++void loadHostname() {
++  char sfx[8];
++  macSuffix(sfx, sizeof(sfx), false);
++  snprintf(default_host, sizeof(default_host), "meshcore-%s", sfx);
++  if (prefs->wifi_hostname[0] && validHostname(prefs->wifi_hostname)) strncpy(host, prefs->wifi_hostname, sizeof(host) - 1);
++  else strncpy(host, default_host, sizeof(host) - 1);
++  host[sizeof(host) - 1] = 0;
++}
++
++// Our current address(es), for the aliases: the home network's and, while it's up, the hotspot's.
++int ourAddrs(mdns_ip_addr_t a[2]) {
++  int n = 0;
++  memset(a, 0, 2 * sizeof(mdns_ip_addr_t));
++  if (WiFi.status() == WL_CONNECTED) { a[n].addr.type = ESP_IPADDR_TYPE_V4; a[n].addr.u_addr.ip4.addr = (uint32_t)WiFi.localIP(); n++; }
++  if (WiFi.getMode() & WIFI_MODE_AP) { a[n].addr.type = ESP_IPADDR_TYPE_V4; a[n].addr.u_addr.ip4.addr = (uint32_t)WiFi.softAPIP(); n++; }
++  if (n == 2) a[0].next = &a[1];
++  return n;
++}
++
++// Answer for other names too, at our address(es): mDNS "delegated" host names. Wanted: the
++// built-in name and the one before the last rename, unless it's the name we answer as anyway.
++void syncAliases() {
++  const char* want[2] = {default_host, prev_host};
++  for (auto& w : want) if (!w[0] || strcmp(w, host) == 0) w = "";
++  if (strcmp(want[0], want[1]) == 0) want[1] = "";
++  mdns_ip_addr_t a[2];
++  int n = ourAddrs(a);
++  for (int i = 0; i < 2; i++) {   // drop the ones no longer wanted (or with nowhere to point)
++    if (!aliases[i][0]) continue;
++    bool keep = n && (strcmp(aliases[i], want[0]) == 0 || strcmp(aliases[i], want[1]) == 0);
++    if (!keep) { mdns_delegate_hostname_remove(aliases[i]); aliases[i][0] = 0; }
++  }
++  if (!n) return;
++  for (const char* w : want) {   // (re)register each at our current addresses
++    if (!w[0]) continue;
++    int slot = -1;
++    for (int i = 0; i < 2; i++) if (strcmp(aliases[i], w) == 0) slot = i;
++    if (slot >= 0) mdns_delegate_hostname_remove(w);   // this core has no set_address: re-add
++    for (int i = 0; i < 2 && slot < 0; i++) if (!aliases[i][0]) slot = i;
++    if (slot < 0) continue;
++    if (mdns_delegate_hostname_add(w, a) == ESP_OK) strlcpy(aliases[slot], w, sizeof(aliases[slot]));
++    else aliases[slot][0] = 0;
++  }
++}
++
++// Start mDNS (once), or bring it up to date: our name, the node name in the TXT record, aliases.
++void startMdns() {
++  if (!mdns_up) {
++    mdns_up = MDNS.begin(host);
++    if (!mdns_up) return;
++    strlcpy(mdns_host, host, sizeof(mdns_host));
++    MDNS.addService("meshcore", "tcp", port);
++  } else if (strcmp(mdns_host, host) != 0 && mdns_hostname_set(host) == ESP_OK) {
++    strlcpy(mdns_host, host, sizeof(mdns_host));
++  }
++  MDNS.addServiceTxt("meshcore", "tcp", "node", (const char*)prefs->node_name);
++  syncAliases();
++}
++
++void beginNet(int i) {
++  WiFi.begin(nets[i].ssid, nets[i].pwd[0] ? nets[i].pwd : nullptr);
++  last_retry = millis();
++}
++
++void joinSaved() {
++  if (!haveSaved()) return;
++  last_retry = millis();
++  if (net_count == 1) { beginNet(0); return; }
++  // several: look around first (finished in pickFromScan)
++  if (WiFi.scanComplete() != WIFI_SCAN_RUNNING) { WiFi.disconnect(false); WiFi.scanNetworks(true); }
++  scan_to_join = true;
++}
++
++void pickFromScan() {
++  int n = WiFi.scanComplete();
++  if (!scan_to_join || n == WIFI_SCAN_RUNNING) return;
++  scan_to_join = false;
++  int best = -1, strongest = -1, strongest_rssi = -1000;
++  for (int i = 0; i < net_count && best < 0; i++)
++    for (int k = 0; k < n; k++) {
++      if (WiFi.SSID(k) != nets[i].ssid) continue;
++      int r = WiFi.RSSI(k);
++      if (r >= MIN_RSSI) { best = i; break; }
++      if (r > strongest_rssi) { strongest_rssi = r; strongest = i; }
++    }
++  if (best < 0) best = strongest;
++  if (best < 0) best = rr_next++ % net_count;   // none in sight (or hidden): take turns
++  beginNet(best);
++}
++
++// ---- setup page ------------------------------------------------------------
++// Nearby network names are attacker-controlled: always escape before putting them in HTML.
++String esc(const String& s) {
++  String o;
++  o.reserve(s.length() + 8);
++  for (size_t i = 0; i < s.length(); i++) {
++    char c = s[i];
++    switch (c) {
++      case '&': o += F("&amp;"); break;
++      case '<': o += F("&lt;"); break;
++      case '>': o += F("&gt;"); break;
++      case '"': o += F("&quot;"); break;
++      case '\'': o += F("&#39;"); break;
++      default: o += c;
++    }
++  }
++  return o;
++}
++
++String formAction();   // defined after the page builder
++
++const char PAGE_HEAD[] PROGMEM = R"(<!doctype html><html lang="en"><head><meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1"><title>MeshCore WiFi setup</title><style>
++:root{color-scheme:light dark;--b:#e5e5e5;--m:#737373;--a:#171717;--af:#fff}
++@media(prefers-color-scheme:dark){:root{--b:#333;--m:#a3a3a3;--a:#fafafa;--af:#171717}}
++body{font:15px/1.45 system-ui,sans-serif;margin:0;padding:24px 16px;max-width:440px;margin-inline:auto}
++h1{font-size:20px;margin:0 0 4px}p{color:var(--m);margin:0 0 16px}label{display:block;font-weight:600;margin:14px 0 6px}
++.n{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--b);border-radius:10px;margin:6px 0;cursor:pointer}
++.n span{margin-left:auto;color:var(--m);font-size:13px}input[type=text],input[type=password]{width:100%;box-sizing:border-box;
++padding:10px 12px;border:1px solid var(--b);border-radius:10px;font:inherit;background:transparent;color:inherit}
++button{margin-top:20px;width:100%;padding:12px;border:0;border-radius:10px;background:var(--a);color:var(--af);font:inherit;font-weight:600}
++small{color:var(--m)}a{color:inherit}.err{color:#dc2626;font-weight:600}</style></head><body>)";
++
++String networkList() {
++  String o;
++  int n = WiFi.scanComplete();
++  if (n == WIFI_SCAN_RUNNING) return F("<p>Scanning for networks… <a href=\"/\">refresh</a></p>");
++  if (n <= 0) {
++    if (n != WIFI_SCAN_RUNNING) WiFi.scanNetworks(true);
++    return F("<p>No networks found yet. <a href=\"/\">Scan again</a></p>");
++  }
++  // strongest first, skip duplicates and hidden networks
++  int idx[40], m = 0;
++  for (int i = 0; i < n && m < 40; i++) {
++    if (WiFi.SSID(i).length() == 0) continue;
++    bool dup = false;
++    for (int j = 0; j < m; j++) if (WiFi.SSID(idx[j]) == WiFi.SSID(i)) { dup = true; break; }
++    if (!dup) idx[m++] = i;
++  }
++  for (int a = 0; a < m; a++)
++    for (int b = a + 1; b < m; b++)
++      if (WiFi.RSSI(idx[b]) > WiFi.RSSI(idx[a])) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
++  for (int k = 0; k < m && k < 15; k++) {
++    int i = idx[k];
++    String ssid = esc(WiFi.SSID(i));
++    bool open = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
++    bool saved = findNet(WiFi.SSID(i).c_str()) >= 0;
++    o += F("<label class=n><input type=radio name=ssid value=\"");
++    o += ssid;
++    o += saved ? F("\" checked>") : F("\">");
++    o += ssid;
++    o += F("<span>");
++    o += saved ? F("saved · ") : F("");
++    o += open ? F("open · ") : F("");
++    o += String(WiFi.RSSI(i));
++    o += F(" dBm</span></label>");
++  }
++  o += F("<small><a href=\"");
++#ifdef WEB_UI
++  o += F("/wifi/rescan");
++#else
++  o += F("/rescan");
++#endif
++  o += F("\">Scan again</a></small>");
++  return o;
++}
++
++String buildPage(const String& error) {
++  String o = FPSTR(PAGE_HEAD);
++  o += F("<h1>Connect your MeshCore radio to WiFi</h1><p>Node <b>");
++  o += esc(prefs->node_name);
++  o += F("</b>. After saving it restarts, joins your network and can be reached as <b>");
++  o += esc(host);
++  o += F(".local</b>.</p>");
++  if (error.length()) { o += F("<p class=err>"); o += esc(error); o += F("</p>"); }
++  if (net_count) {   // the radio joins whichever of these it can find; this adds one (or updates it) as the preferred
++    o += F("<p>Saved: ");
++    for (int i = 0; i < net_count; i++) { o += i ? F(", ") : F(""); o += esc(nets[i].ssid); }
++    o += F(". Choosing one here makes it the preferred network.</p>");
++  }
++  o += F("<form method=post action=\"");
++  o += formAction();
++  o += F("\"><label>Network</label>");
++  o += networkList();
++  o += F("<label for=m>Or type a network name</label><input type=text id=m name=ssid_manual maxlength=32 autocomplete=off>"
++         "<label for=p>Password</label><input type=password id=p name=pwd maxlength=63 autocomplete=off>"
++         "<small>");
++  o += haveSaved() ? F("For a saved network, leave it empty to keep its password. ") : F("");
++  o += F("Leave empty for an open network.</small><label for=h>Hostname</label><input type=text id=h name=host maxlength=32 "
++         "pattern=\"[a-z0-9]([a-z0-9-]*[a-z0-9])?\" value=\"");
++  o += esc(host);
++  o += F("\"><small>Lowercase letters, digits and dashes. MeshChat finds the radio at this name plus .local</small>"
++         "<button>Save and connect</button></form></body></html>");
++  return o;
++}
++
++String formAction() {
++#ifdef WEB_UI
++  return F("/wifi/save");
++#else
++  return F("/save");
++#endif
++}
++
++// returns "" on success (and schedules the restart), otherwise the error to show
++String saveSettings(String ssid, String ssid_manual, String pwd, String h) {
++  ssid_manual.trim();
++  if (ssid_manual.length()) ssid = ssid_manual;
++  h.trim();
++  h.toLowerCase();
++  if (!ssid.length() || ssid.length() > 32) return F("Choose a network or type its name.");
++  if (h.length() && !validHostname(h.c_str())) return F("Hostname: lowercase letters, digits and dashes, up to 32.");
++  char err[80];
++  if (!addNetwork(ssid.c_str(), pwd.c_str(), true, err, sizeof(err))) return String(err);   // added (or updated) as the preferred one
++  if (h.length()) strncpy(prefs->wifi_hostname, h.c_str(), sizeof(prefs->wifi_hostname) - 1);
++  prefs->wifi_hostname[sizeof(prefs->wifi_hostname) - 1] = 0;
++  prefs->wifi_enabled = 1;
++  save();
++  loadHostname();
++  restart_at = millis() + 1500;   // let the reply reach the phone first
++  return "";
++}
++
++String savedPage(const String& ssid) {
++  String o = FPSTR(PAGE_HEAD);
++  o += F("<h1>Saved</h1><p>Restarting and joining <b>");
++  o += esc(ssid);
++  o += F("</b>. Reconnect this device to your usual WiFi. MeshChat can then reach the radio at <b>http://");
++  o += esc(host);
++  o += F(".local</b>.</p><p>If it can't join, the setup hotspot comes back within a minute.</p></body></html>");
++  return o;
++}
++
++#ifndef WEB_UI
++void sendPage(const String& error) {
++  web->sendHeader("Cache-Control", "no-store");
++  web->send(200, "text/html; charset=utf-8", buildPage(error));
++}
++#endif
++
++#ifndef WEB_UI
++void handleSave() {
++  String err = saveSettings(web->arg("ssid"), web->arg("ssid_manual"), web->arg("pwd"), web->arg("host"));
++  if (err.length()) return sendPage(err);
++  web->sendHeader("Connection", "close");
++  web->send(200, "text/html; charset=utf-8", savedPage(prefs->wifi_ssid));
++}
++#endif
++
++void startSetup(bool by_user) {
++  if (mode == SETUP) { forced = forced || by_user; return; }
++  char sfx[8];
++  macSuffix(sfx, sizeof(sfx), true);
++  snprintf(ap_name, sizeof(ap_name), "MeshCore-Setup-%s", sfx);
++  WiFi.mode(haveSaved() ? WIFI_AP_STA : WIFI_AP);   // keep trying the saved network meanwhile
++  WiFi.softAP(ap_name, AP_PASSWORD);
++  // One radio for both: a station hunting for an out-of-range network drags the hotspot from
++  // channel to channel, and phones fail to join it. So no automatic reconnects while the hotspot
++  // is up; loop() tries the saved network once a minute, and only while nobody is on the hotspot.
++  // (An attempt already under way, e.g. the first one at boot, still finishes.)
++  WiFi.setAutoReconnect(false);
++  last_retry = millis();
++  delay(100);
++  dns = new DNSServer();
++  dns->setErrorReplyCode(DNSReplyCode::NoError);
++  dns->start(53, "*", WiFi.softAPIP());   // every name resolves to us: phones show the setup page
++  startMdns();   // and <hostname>.local keeps working here (mDNS answers on the hotspot too)
++#ifndef WEB_UI
++  web = new WebServer(80);
++  web->on("/", HTTP_GET, []() { sendPage(""); });
++  web->on("/rescan", HTTP_GET, []() { WiFi.scanDelete(); WiFi.scanNetworks(true); web->sendHeader("Location", "/"); web->send(302); });
++  web->on("/save", HTTP_POST, handleSave);
++  web->onNotFound([]() {   // captive-portal probes (/generate_204, /hotspot-detect.html, …)
++    web->sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/");
++    web->send(302);
++  });
++  web->begin();
++#endif
++  WiFi.scanNetworks(true);
++  mode = SETUP;
++  forced = by_user;
++  setup_since = millis();
++}
++
++void stopSetup() {
++  if (mode != SETUP) return;
++  if (web) { web->stop(); delete web; web = nullptr; }
++  if (dns) { dns->stop(); delete dns; dns = nullptr; }
++  WiFi.softAPdisconnect(true);
++  WiFi.mode(WIFI_STA);
++  WiFi.setAutoReconnect(true);
++  mode = STATION;
++  forced = false;
++  if (WiFi.status() == WL_CONNECTED) startMdns(); else joinSaved();
++}
++
++}  // namespace
++
++bool validHostname(const char* h) {
++  size_t n = strlen(h);
++  if (n < 1 || n > 32 || h[0] == '-' || h[n - 1] == '-') return false;
++  for (size_t i = 0; i < n; i++) {
++    char c = h[i];
++    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
++  }
++  return true;
++}
++
++const char* hostname() { return host; }
++const char* defaultHostname() { return default_host; }
++
++bool isOwnName(const char* h) {   // h without ".local"
++  return strcasecmp(h, host) == 0 || strcasecmp(h, default_host) == 0 || (prev_host[0] && strcasecmp(h, prev_host) == 0);
++}
++
++const char* modeName() {
++  if (mode == SETUP) return "setup";
++  if (mode == OFF) return "off";
++  return WiFi.status() == WL_CONNECTED ? "connected" : "connecting";
++}
++
++int rssi() { return WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0; }
++
++void requestSetup() { requested = true; }
++
++bool inSetup() { return mode == SETUP; }
++
++int networkCount() { return net_count; }
++const char* networkSsid(int i) { return i >= 0 && i < net_count ? nets[i].ssid : ""; }
++bool networkHasPassword(int i) { return i >= 0 && i < net_count && nets[i].pwd[0]; }
++const char* connectedSsid() {
++  static char s[33];
++  strncpy(s, WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "", sizeof(s) - 1);
++  return s;
++}
++
++bool addNetwork(const char* ssid, const char* pwd, bool preferred, char* error, size_t cap) {
++  size_t sl = strlen(ssid), pl = strlen(pwd);
++  if (!sl || sl > 32) { strncpy(error, "Network names are 1-32 bytes.", cap); return false; }
++  if (pl && (pl < 8 || pl > 63)) { strncpy(error, "WiFi passwords are 8 to 63 characters.", cap); return false; }
++  int i = findNet(ssid);
++  if (i < 0) {
++    if (net_count >= MAX_NETS) { strncpy(error, "Eight networks are saved already. Remove one first.", cap); return false; }
++    i = net_count++;
++    strncpy(nets[i].ssid, ssid, sizeof(nets[i].ssid) - 1); nets[i].ssid[32] = 0;
++    nets[i].pwd[0] = 0;
++  }
++  if (pl) { strncpy(nets[i].pwd, pwd, sizeof(nets[i].pwd) - 1); nets[i].pwd[63] = 0; }   // empty: keep the saved one
++  if (preferred && i > 0) { Net t = nets[i]; for (int k = i; k > 0; k--) nets[k] = nets[k - 1]; nets[0] = t; }
++  prefs->wifi_enabled = 1;
++  saveNets();
++  return true;
++}
++
++bool removeNetwork(const char* ssid) {
++  int i = findNet(ssid);
++  if (i < 0) return false;
++  memset(nets[i].pwd, 0, sizeof(nets[i].pwd));
++  for (int k = i; k < net_count - 1; k++) nets[k] = nets[k + 1];
++  net_count--;
++  memset(&nets[net_count], 0, sizeof(Net));
++  saveNets();
++  return true;
++}
++
++bool preferNetwork(const char* ssid) {
++  int i = findNet(ssid);
++  if (i <= 0) return i == 0;
++  Net t = nets[i];
++  for (int k = i; k > 0; k--) nets[k] = nets[k - 1];
++  nets[0] = t;
++  saveNets();
++  return true;
++}
++bool hasSavedNetwork() { return haveSaved(); }
++
++#ifdef WEB_UI
++void setupPage(char* out, size_t cap, const char* error) {
++  String o = buildPage(error ? String(error) : String());
++  strncpy(out, o.c_str(), cap - 1);
++  out[cap - 1] = 0;
++}
++
++void rescan() { WiFi.scanDelete(); WiFi.scanNetworks(true); }
++
++bool applySetup(const char* ssid, const char* pwd, const char* host_in, char* error, size_t error_cap) {
++  String err = saveSettings(String(ssid), String(""), String(pwd), String(host_in));
++  strncpy(error, err.c_str(), error_cap - 1);
++  error[error_cap - 1] = 0;
++  return err.length() == 0;
++}
++#endif   // acted on in loop(), not inside the CLI handler
++
++void hostnameChanged() {
++  if (strcmp(prev_host, host) != 0) strncpy(prev_host, host, sizeof(prev_host) - 1);   // keep the old name answering until restart
++  loadHostname();
++  WiFi.setHostname(host);   // DHCP name: used from the next (re)connect
++  if (mode == SETUP || WiFi.status() == WL_CONNECTED) startMdns();   // on the hotspot too
++}
++
++void begin(NodePrefs* p, void (*save_prefs)(), uint16_t tcp_port, bool force_setup) {
++  prefs = p;
++  save = save_prefs;
++  port = tcp_port;
++  boot_ms = millis();
++  WiFi.persistent(false);   // credentials live in our file and MeshCore's prefs, not the ESP32's NVS
++  loadHostname();
++  loadNets();
++  WiFi.onEvent([](WiFiEvent_t e, WiFiEventInfo_t) {
++    if (e == ARDUINO_EVENT_WIFI_STA_GOT_IP) ev_got_ip = true;
++    else if (e == ARDUINO_EVENT_WIFI_STA_DISCONNECTED || e == ARDUINO_EVENT_WIFI_STA_LOST_IP) ev_lost = true;
++  });
++  if (!prefs->wifi_enabled && !force_setup) { mode = OFF; return; }
++  WiFi.setHostname(host);   // must precede WiFi.mode()/begin()
++  WiFi.mode(WIFI_STA);
++  WiFi.setAutoReconnect(true);
++  mode = STATION;
++  joinSaved();
++  if (force_setup || !haveSaved()) startSetup(force_setup);
++}
++
++void loop() {
++  if (mode == OFF && !requested) return;
++  uint32_t now = millis();
++  if (restart_at && (int32_t)(now - restart_at) > 0) ESP.restart();
++
++  if (ev_got_ip) {
++    ev_got_ip = false;
++    ever_connected = true;
++    lost_since = 0;
++    if (mode == SETUP && !forced) stopSetup();   // the saved network came back: no need for setup
++    else if (mode != SETUP) startMdns();
++  }
++  if (ev_lost) {
++    ev_lost = false;
++    if (!lost_since) lost_since = now;
++    // mDNS keeps running: the component stops answering on the lost interface by itself
++  }
++  if (requested) {
++    requested = false;
++    if (mode == OFF) { WiFi.setHostname(host); WiFi.mode(WIFI_STA); mode = STATION; }
++    startSetup(true);
++  }
++
++  pickFromScan();   // a scan for joining finished: pick the network
++
++  if (mode == SETUP) {
++    dns->processNextRequest();
++    if (web) web->handleClient();
++    if (haveSaved() && WiFi.status() != WL_CONNECTED && WiFi.softAPgetStationNum() == 0 && now - last_retry > SETUP_RETRY_EVERY) {
++      joinSaved();   // back in range? (ev_got_ip then closes an automatic hotspot)
++    }
++    if (!forced && haveSaved() && now - setup_since > AUTO_SETUP_LIMIT && WiFi.softAPgetStationNum() == 0) {
++      stopSetup();   // nobody came to set it up: go back to trying the saved network
++      setup_since = now;
++      boot_ms = now; ever_connected = false;
++    }
++    return;
++  }
++
++  if (mode == STATION && WiFi.status() != WL_CONNECTED) {
++    if (!ever_connected && now - boot_ms > JOIN_TIMEOUT) { startSetup(false); return; }
++    if (lost_since && ever_connected && now - lost_since > LOST_TIMEOUT) { startSetup(false); return; }
++    if (now - last_retry > RETRY_EVERY) joinSaved();
++  }
++}
++
++}  // namespace wifinet
++#endif
+diff --git a/examples/companion_radio/WifiPortal.h b/examples/companion_radio/WifiPortal.h
+new file mode 100644
+index 0000000..bbe3dee
+--- /dev/null
++++ b/examples/companion_radio/WifiPortal.h
+@@ -0,0 +1,47 @@
++#pragma once
++// WiFi for the companion radio with runtime setup (MeshChat addition, not upstream MeshCore).
++//  - joins the saved network and announces <hostname>.local (mDNS, _meshcore._tcp)
++//  - opens a "MeshCore-Setup-XXXX" hotspot with a setup page when there is no saved network,
++//    when it can't be joined, when the user button is held at power-up, or on request (CLI)
++//  - <hostname>.local keeps answering on the hotspot too, so bookmarks and the home-screen app work there
++#ifdef WIFI_PORTAL
++#include <stddef.h>
++#include <stdint.h>
++
++class NodePrefs;
++
++namespace wifinet {
++  // force_setup: open the setup hotspot now (button held at boot); it stays until saved
++  void begin(NodePrefs* prefs, void (*save_prefs)(), uint16_t tcp_port, bool force_setup);
++  void loop();
++  void requestSetup();           // CLI "set wifi.setup"
++  void hostnameChanged();        // re-announce with the new name
++  bool validHostname(const char* h);
++  const char* hostname();
++  const char* defaultHostname();   // built-in meshcore-xxxx, always answered as well (bookmarks survive renames)
++  bool isOwnName(const char* h);   // h (without .local) is one of the names this radio answers to
++  const char* modeName();        // "connected", "connecting", "setup", "off"
++  int rssi();                    // dBm, 0 when not connected
++  bool inSetup();
++  bool hasSavedNetwork();        // a home network is configured (the hotspot is then a fallback, not first setup)
++
++  // Saved networks: up to 8, most preferred first. The radio joins the most preferred one in range
++  // with a usable signal, otherwise the strongest one in range. Passwords never leave the radio.
++  // Changes: main task only.
++  int networkCount();
++  const char* networkSsid(int i);
++  bool networkHasPassword(int i);
++  const char* connectedSsid();   // "" when not connected
++  // adds or updates (an empty password keeps the saved one); preferred: move it to the top
++  bool addNetwork(const char* ssid, const char* pwd, bool preferred, char* error, size_t error_cap);
++  bool removeNetwork(const char* ssid);
++  bool preferNetwork(const char* ssid);
++#ifdef WEB_UI
++  // In web-UI builds the setup page is served by the web UI's server at /wifi (one server on :80)
++  void setupPage(char* out, size_t cap, const char* error);   // full HTML page
++  void rescan();
++  // validates; on success stores ssid/password/hostname, saves and restarts shortly. Main task only.
++  bool applySetup(const char* ssid, const char* pwd, const char* host, char* error, size_t error_cap);
++#endif
++}
++#endif
+diff --git a/examples/companion_radio/main.cpp b/examples/companion_radio/main.cpp
+index 839d495..5bccb7d 100644
+--- a/examples/companion_radio/main.cpp
++++ b/examples/companion_radio/main.cpp
+@@ -59,11 +59,18 @@ MultiSerialInterface interface_manager;
+   #if defined(ESP32) || defined(RP2040_PLATFORM)
+     #include <helpers/wifi/SerialWifiInterface.h>
+     SerialWifiInterface wifi_interface;
++    #ifdef WIFI_PORTAL
++      #include "WifiPortal.h"
++    #endif
+   #else
+     #error "SerialWifiInterface is not defined for this platform"
+   #endif
+ #endif
+ 
++#ifdef WEB_UI
++  #include "WebUi.h"
++#endif
++
+ // include usb interface
+ #if defined(ENABLE_USB_INTERFACE)
+   #include <helpers/ArduinoSerialInterface.h>
+@@ -114,7 +121,12 @@ MultiSerialInterface interface_manager;
+ 
+ StdRNG fast_rng;
+ SimpleMeshTables tables;
+-MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store);
++#ifdef MESH_IN_PSRAM
++  #include <esp_heap_caps.h>
++  MyMesh* the_mesh_ptr = nullptr;
++#else
++  MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store);
++#endif
+ 
+ /* END GLOBAL OBJECTS */
+ 
+@@ -133,6 +145,13 @@ void halt() {
+ #endif
+ 
+ void setup() {
++#ifdef MESH_IN_PSRAM
++  {
++    void* mem = heap_caps_malloc(sizeof(MyMesh), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    if (!mem) mem = malloc(sizeof(MyMesh));   // no PSRAM: fall back to internal RAM
++    the_mesh_ptr = new (mem) MyMesh(radio_driver, fast_rng, rtc_clock, tables, store);
++  }
++#endif
+   Serial.begin(115200);
+   board.begin();
+ 
+@@ -211,7 +230,32 @@ void setup() {
+ #endif
+ 
+ // add wifi interface
+-#ifdef ENABLE_WIFI_INTERFACE
++#if defined(ENABLE_WIFI_INTERFACE) && defined(WIFI_PORTAL)
++  {
++    // MeshChat: holding the user button while powering up / resetting opens the setup hotspot
++    bool hold = false;
++  #ifdef PIN_USER_BTN
++    pinMode(PIN_USER_BTN, INPUT_PULLUP);
++    if (digitalRead(PIN_USER_BTN) == LOW) {
++      hold = true;
++      uint32_t t0 = millis();
++      while (millis() - t0 < 1500) {
++        if (digitalRead(PIN_USER_BTN) != LOW) { hold = false; break; }
++        delay(10);
++      }
++      // That was the WiFi setup gesture. Wait for the button to come up before the UI starts, or
++      // it reads the same press as a long press in its first 8 s: the CLI rescue mode, which stops
++      // serving Bluetooth, the app's WiFi link and USB.
++      uint32_t t1 = millis();
++      while (hold && digitalRead(PIN_USER_BTN) == LOW && millis() - t1 < 20000) delay(10);
++    }
++  #endif
++    board.setInhibitSleep(true);   // prevent sleep when WiFi is active
++    wifinet::begin(the_mesh.getNodePrefs(), []() { the_mesh.savePrefs(); }, TCP_PORT, hold);
++    wifi_interface.begin(TCP_PORT);
++    interface_manager.addInterface(InterfaceType::WiFi, &wifi_interface);
++  }
++#elif defined(ENABLE_WIFI_INTERFACE)
+   // use wifi ssid and password from prefs if ssid is not empty, otherwise use the build flag defaults
+   if (the_mesh.getNodePrefs()->wifi_ssid[0]) {
+     strcpy(wifi_ssid, the_mesh.getNodePrefs()->wifi_ssid);
+@@ -254,6 +298,11 @@ void setup() {
+   }
+ #endif
+ 
++// MeshChat: the web UI is a built-in app (after WiFi, so the network stack is up)
++#ifdef WEB_UI
++  interface_manager.addInterface(InterfaceType::Internal, webui::begin(&the_mesh));
++#endif
++
+ // add usb interface
+ #if defined(ENABLE_USB_INTERFACE)
+   usb_serial_interface.begin(Serial);
+@@ -292,6 +341,9 @@ void setup() {
+ void loop() {
+   the_mesh.loop();
+   interface_manager.loop();
++#ifdef WEB_UI
++  webui::loop();
++#endif
+   sensors.loop();
+ #ifdef DISPLAY_CLASS
+   ui_task.loop();
+@@ -308,7 +360,9 @@ void loop() {
+ #endif
+   }
+ 
+-#ifdef ENABLE_WIFI_INTERFACE
++#if defined(ENABLE_WIFI_INTERFACE) && defined(WIFI_PORTAL)
++  wifinet::loop();
++#elif defined(ENABLE_WIFI_INTERFACE)
+   if (wifi_enabled) {
+     // RP2040 has no WiFi event callbacks, so poll the link state instead
+   #if defined(RP2040_PLATFORM)
+diff --git a/examples/companion_radio/ui-new/UITask.cpp b/examples/companion_radio/ui-new/UITask.cpp
+index bc25de7..84ae740 100644
+--- a/examples/companion_radio/ui-new/UITask.cpp
++++ b/examples/companion_radio/ui-new/UITask.cpp
+@@ -1006,6 +1006,9 @@ void UITask::loop() {
+   }
+ #endif
+ 
++  // No screen (the XIAO kit has none): the menu is invisible, and pressing through it blind could
++  // switch Bluetooth off or put the radio to sleep. Keep only what the handlers above do directly.
++  if (_display == NULL) c = 0;
+   if (c != 0 && curr) {
+     curr->handleInput(c);
+     _auto_off = millis() + AUTO_OFF_MILLIS;   // extend auto-off timer
+diff --git a/src/helpers/MultiSerialInterface.h b/src/helpers/MultiSerialInterface.h
+index f7742b2..e6fc604 100644
+--- a/src/helpers/MultiSerialInterface.h
++++ b/src/helpers/MultiSerialInterface.h
+@@ -13,7 +13,8 @@ enum class InterfaceType : uint8_t {
+   USB,
+   WiFi,
+   Ethernet,
+-  HardwareSerial
++  HardwareSerial,
++  Internal      // MeshChat: the built-in web UI app
+ };
+ 
+ class MultiSerialInterface : public BaseSerialInterface {

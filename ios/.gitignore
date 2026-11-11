@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+MeshChat.xcodeproj/
+App/Info.plist
+xcuserdata/
+DerivedData/
+Widgets/Info.plist

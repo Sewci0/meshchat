@@ -1,0 +1,98 @@
+{
+  "sourceLanguage": "en",
+  "version": "1.0",
+  "strings": {
+    "NSBluetoothAlwaysUsageDescription": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat connects to your MeshCore radio over Bluetooth to send and receive messages."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat łączy się z twoim radiem MeshCore przez Bluetooth, żeby wysyłać i odbierać wiadomości."
+          }
+        },
+        "cs": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat se připojuje k vašemu rádiu MeshCore přes Bluetooth, aby mohl odesílat a přijímat zprávy."
+          }
+        }
+      }
+    },
+    "NSLocalNetworkUsageDescription": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat connects to MeshCore radios on your WiFi network."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat łączy się z radiami MeshCore w twojej sieci WiFi."
+          }
+        },
+        "cs": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat se připojuje k rádiím MeshCore ve vaší síti WiFi."
+          }
+        }
+      }
+    },
+    "NSCameraUsageDescription": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat reads MeshCore QR codes to add contacts and channels."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat odczytuje kody QR MeshCore, żeby dodawać kontakty i kanały."
+          }
+        },
+        "cs": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat čte QR kódy MeshCore, aby mohl přidávat kontakty a kanály."
+          }
+        }
+      }
+    },
+    "NSLocationWhenInUseUsageDescription": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat uses your location to keep a WiFi radio connected while the app is in the background, and, if you choose, to centre the map or set your node's position. Your position is sent only if you share it on the mesh."
+          }
+        },
+        "pl": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat używa twojej lokalizacji, żeby utrzymać połączenie z radiem WiFi, gdy aplikacja działa w tle, oraz – jeśli zechcesz – żeby wyśrodkować mapę lub ustawić pozycję twojego węzła. Pozycja jest wysyłana tylko wtedy, gdy udostępnisz ją w sieci mesh."
+          }
+        },
+        "cs": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MeshChat používá vaši polohu k udržení spojení s rádiem přes WiFi, když aplikace běží na pozadí, a pokud chcete, k vystředění mapy nebo nastavení polohy vašeho uzlu. Poloha se odesílá, jen pokud ji sdílíte v síti mesh."
+          }
+        }
+      }
+    }
+  }
+}

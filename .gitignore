@@ -1,0 +1,13 @@
+# local data, never committed
+/data/
+# Python and Node environments and caches
+.venv/
+__pycache__/
+node_modules/
+# the web app's build output (`npm run build` in firmware/webui), embedded into the firmware
+firmware/webui/dist/
+# firmware images: built from the patch, published as release assets rather than committed
+*.bin
+# chanfind, compiled on first use by firmware/tools/find_channel_names.py
+firmware/tools/.chanfind
+.DS_Store
