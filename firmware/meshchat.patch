@@ -3279,10 +3279,10 @@ index 0000000..7a465cc
 +#endif
 diff --git a/examples/companion_radio/WifiPortal.cpp b/examples/companion_radio/WifiPortal.cpp
 new file mode 100644
-index 0000000..8fba80f
+index 0000000..45dda95
 --- /dev/null
 +++ b/examples/companion_radio/WifiPortal.cpp
-@@ -0,0 +1,586 @@
+@@ -0,0 +1,650 @@
 +// See WifiPortal.h. MeshChat addition to the MeshCore companion firmware.
 +#ifdef WIFI_PORTAL
 +#include "WifiPortal.h"
@@ -3303,6 +3303,7 @@ index 0000000..8fba80f
 +const uint32_t AUTO_SETUP_LIMIT = 10UL * 60000; // an automatic hotspot nobody uses closes and retries
 +const uint32_t RETRY_EVERY = 15000;
 +const uint32_t SETUP_RETRY_EVERY = 60000;      // with the hotspot up: try the saved network this often, when nobody's on it
++const uint8_t AUTH_GIVE_UP = 3;               // a network refused the password this many times in a row: stop trying it
 +const char* AP_PASSWORD = "meshcore";         // WPA2 needs 8+ chars; documented in MeshChat's README
 +
 +enum Mode { OFF, STATION, SETUP };
@@ -3328,7 +3329,15 @@ index 0000000..8fba80f
 +char aliases[2][33] = {{0}};   // delegated names currently registered
 +uint32_t boot_ms = 0, setup_since = 0, last_retry = 0, lost_since = 0, restart_at = 0;
 +volatile bool ev_got_ip = false, ev_lost = false;
++volatile uint8_t ev_auth_fails = 0;   // disconnects where the network refused our password (event task -> loop)
++char trying[33] = {0};                // the network the station is joining (what ev_auth_fails is about)
 +WebServer* web = nullptr;
++
++// Time since t, with millis() read now. Not loop()'s `now`: these stamps can be set later in the same
++// pass (pickFromScan() -> beginNet() sets last_retry), and `now - last_retry` then wrapped to ~49 days,
++// so the retry fired at once: with several saved networks every join was cut off by a new scan 3 s
++// later, the radio never connected, and the setup hotspot was off its channel most of the time.
++uint32_t since(uint32_t t) { return millis() - t; }
 +DNSServer* dns = nullptr;
 +
 +// ---- saved networks --------------------------------------------------------
@@ -3337,12 +3346,29 @@ index 0000000..8fba80f
 +const int MAX_NETS = 8;
 +const int MIN_RSSI = -85;   // weaker than this, a less preferred but stronger network wins
 +const char* NETS_FILE = "/wifi_nets";
-+struct Net { char ssid[33]; char pwd[64]; };
++// auth_fails: refusals in a row since the last success or password change (this boot only, not saved)
++struct Net { char ssid[33]; char pwd[64]; uint8_t auth_fails; };
 +Net nets[MAX_NETS];
 +int net_count = 0, rr_next = 0;
 +bool scan_to_join = false;
 +
 +bool haveSaved() { return net_count > 0; }
++
++// A wrong password never fixes itself, and every attempt takes the radio off the hotspot's channel
++// (the station scans all channels, then joins the network's), so the phone meant to fix the password
++// may fail to join the hotspot. Once a network has refused it a few times, it's left alone (until
++// its password is changed, or the hotspot's periodic retry) and the hotspot opens right away.
++bool rejected(int i) { return nets[i].auth_fails >= AUTH_GIVE_UP; }
++int usableCount() {
++  int n = 0;
++  for (int i = 0; i < net_count; i++) if (!rejected(i)) n++;
++  return n;
++}
++bool passwordRefused(uint8_t reason) {
++  return reason == WIFI_REASON_AUTH_FAIL || reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
++         reason == WIFI_REASON_HANDSHAKE_TIMEOUT || reason == WIFI_REASON_MIC_FAILURE ||
++         reason == WIFI_REASON_802_1X_AUTH_FAILED;
++}
 +
 +int findNet(const char* ssid) {
 +  for (int i = 0; i < net_count; i++) if (strcmp(nets[i].ssid, ssid) == 0) return i;
@@ -3460,6 +3486,7 @@ index 0000000..8fba80f
 +}
 +
 +void beginNet(int i) {
++  strlcpy(trying, nets[i].ssid, sizeof(trying));
 +  WiFi.begin(nets[i].ssid, nets[i].pwd[0] ? nets[i].pwd : nullptr);
 +  last_retry = millis();
 +}
@@ -3467,7 +3494,11 @@ index 0000000..8fba80f
 +void joinSaved() {
 +  if (!haveSaved()) return;
 +  last_retry = millis();
-+  if (net_count == 1) { beginNet(0); return; }
++  int usable = usableCount();
++  if (!usable) return;   // each saved network refused its password: the setup hotspot is how to fix that
++  if (usable == 1) {
++    for (int i = 0; i < net_count; i++) if (!rejected(i)) { beginNet(i); return; }
++  }
 +  // several: look around first (finished in pickFromScan)
 +  if (WiFi.scanComplete() != WIFI_SCAN_RUNNING) { WiFi.disconnect(false); WiFi.scanNetworks(true); }
 +  scan_to_join = true;
@@ -3478,16 +3509,21 @@ index 0000000..8fba80f
 +  if (!scan_to_join || n == WIFI_SCAN_RUNNING) return;
 +  scan_to_join = false;
 +  int best = -1, strongest = -1, strongest_rssi = -1000;
-+  for (int i = 0; i < net_count && best < 0; i++)
++  for (int i = 0; i < net_count && best < 0; i++) {
++    if (rejected(i)) continue;
 +    for (int k = 0; k < n; k++) {
 +      if (WiFi.SSID(k) != nets[i].ssid) continue;
 +      int r = WiFi.RSSI(k);
 +      if (r >= MIN_RSSI) { best = i; break; }
 +      if (r > strongest_rssi) { strongest_rssi = r; strongest = i; }
 +    }
++  }
 +  if (best < 0) best = strongest;
-+  if (best < 0) best = rr_next++ % net_count;   // none in sight (or hidden): take turns
-+  beginNet(best);
++  for (int t = 0; t < net_count && best < 0; t++) {   // none in sight (or hidden): take turns
++    int i = rr_next++ % net_count;
++    if (!rejected(i)) best = i;
++  }
++  if (best >= 0) beginNet(best);
 +}
 +
 +// ---- setup page ------------------------------------------------------------
@@ -3575,9 +3611,19 @@ index 0000000..8fba80f
 +  o += esc(host);
 +  o += F(".local</b>.</p>");
 +  if (error.length()) { o += F("<p class=err>"); o += esc(error); o += F("</p>"); }
++  for (int i = 0; i < net_count; i++) {
++    if (!rejected(i)) continue;
++    o += F("<p class=err>");
++    o += esc(nets[i].ssid);
++    o += F(" refused the saved password. Choose it below and enter the right one.</p>");
++  }
 +  if (net_count) {   // the radio joins whichever of these it can find; this adds one (or updates it) as the preferred
 +    o += F("<p>Saved: ");
-+    for (int i = 0; i < net_count; i++) { o += i ? F(", ") : F(""); o += esc(nets[i].ssid); }
++    for (int i = 0; i < net_count; i++) {
++      o += i ? F(", ") : F("");
++      o += esc(nets[i].ssid);
++      if (rejected(i)) o += F(" (password refused)");
++    }
 +    o += F(". Choosing one here makes it the preferred network.</p>");
 +  }
 +  o += F("<form method=post action=\"");
@@ -3655,6 +3701,7 @@ index 0000000..8fba80f
 +  macSuffix(sfx, sizeof(sfx), true);
 +  snprintf(ap_name, sizeof(ap_name), "MeshCore-Setup-%s", sfx);
 +  WiFi.mode(haveSaved() ? WIFI_AP_STA : WIFI_AP);   // keep trying the saved network meanwhile
++  if (haveSaved() && !usableCount()) WiFi.disconnect(false);   // wrong password: stop the attempt under way, so the hotspot keeps its channel
 +  WiFi.softAP(ap_name, AP_PASSWORD);
 +  // One radio for both: a station hunting for an out-of-range network drags the hotspot from
 +  // channel to channel, and phones fail to join it. So no automatic reconnects while the hotspot
@@ -3746,8 +3793,9 @@ index 0000000..8fba80f
 +    i = net_count++;
 +    strncpy(nets[i].ssid, ssid, sizeof(nets[i].ssid) - 1); nets[i].ssid[32] = 0;
 +    nets[i].pwd[0] = 0;
++    nets[i].auth_fails = 0;
 +  }
-+  if (pl) { strncpy(nets[i].pwd, pwd, sizeof(nets[i].pwd) - 1); nets[i].pwd[63] = 0; }   // empty: keep the saved one
++  if (pl) { strncpy(nets[i].pwd, pwd, sizeof(nets[i].pwd) - 1); nets[i].pwd[63] = 0; nets[i].auth_fails = 0; }   // empty: keep the saved one
 +  if (preferred && i > 0) { Net t = nets[i]; for (int k = i; k > 0; k--) nets[k] = nets[k - 1]; nets[0] = t; }
 +  prefs->wifi_enabled = 1;
 +  saveNets();
@@ -3808,9 +3856,12 @@ index 0000000..8fba80f
 +  WiFi.persistent(false);   // credentials live in our file and MeshCore's prefs, not the ESP32's NVS
 +  loadHostname();
 +  loadNets();
-+  WiFi.onEvent([](WiFiEvent_t e, WiFiEventInfo_t) {
++  WiFi.onEvent([](WiFiEvent_t e, WiFiEventInfo_t info) {
 +    if (e == ARDUINO_EVENT_WIFI_STA_GOT_IP) ev_got_ip = true;
-+    else if (e == ARDUINO_EVENT_WIFI_STA_DISCONNECTED || e == ARDUINO_EVENT_WIFI_STA_LOST_IP) ev_lost = true;
++    else if (e == ARDUINO_EVENT_WIFI_STA_DISCONNECTED || e == ARDUINO_EVENT_WIFI_STA_LOST_IP) {
++      ev_lost = true;
++      if (e == ARDUINO_EVENT_WIFI_STA_DISCONNECTED && passwordRefused(info.wifi_sta_disconnected.reason) && ev_auth_fails < 255) ev_auth_fails++;
++    }
 +  });
 +  if (!prefs->wifi_enabled && !force_setup) { mode = OFF; return; }
 +  WiFi.setHostname(host);   // must precede WiFi.mode()/begin()
@@ -3826,10 +3877,18 @@ index 0000000..8fba80f
 +  uint32_t now = millis();
 +  if (restart_at && (int32_t)(now - restart_at) > 0) ESP.restart();
 +
++  if (ev_auth_fails) {
++    uint8_t n = ev_auth_fails;
++    ev_auth_fails = 0;
++    int i = findNet(trying);
++    if (i >= 0) nets[i].auth_fails = (uint8_t)min(255, nets[i].auth_fails + n);
++  }
 +  if (ev_got_ip) {
 +    ev_got_ip = false;
 +    ever_connected = true;
 +    lost_since = 0;
++    int i = findNet(WiFi.SSID().c_str());
++    if (i >= 0) nets[i].auth_fails = 0;
 +    if (mode == SETUP && !forced) stopSetup();   // the saved network came back: no need for setup
 +    else if (mode != SETUP) startMdns();
 +  }
@@ -3849,11 +3908,15 @@ index 0000000..8fba80f
 +  if (mode == SETUP) {
 +    dns->processNextRequest();
 +    if (web) web->handleClient();
-+    if (haveSaved() && WiFi.status() != WL_CONNECTED && WiFi.softAPgetStationNum() == 0 && now - last_retry > SETUP_RETRY_EVERY) {
++    if (haveSaved() && WiFi.status() != WL_CONNECTED && WiFi.softAPgetStationNum() == 0 && since(last_retry) > SETUP_RETRY_EVERY) {
 +      joinSaved();   // back in range? (ev_got_ip then closes an automatic hotspot)
 +    }
-+    if (!forced && haveSaved() && now - setup_since > AUTO_SETUP_LIMIT && WiFi.softAPgetStationNum() == 0) {
-+      stopSetup();   // nobody came to set it up: go back to trying the saved network
++    if (!forced && haveSaved() && since(setup_since) > AUTO_SETUP_LIMIT && WiFi.softAPgetStationNum() == 0) {
++      // nobody came to set it up: go back to trying the saved networks, refused ones included (the
++      // router's password may be back, or those were handshake timeouts on a weak signal). A wrong
++      // password is refused again within seconds and the hotspot comes straight back.
++      for (int i = 0; i < net_count; i++) nets[i].auth_fails = 0;
++      stopSetup();
 +      setup_since = now;
 +      boot_ms = now; ever_connected = false;
 +    }
@@ -3861,9 +3924,10 @@ index 0000000..8fba80f
 +  }
 +
 +  if (mode == STATION && WiFi.status() != WL_CONNECTED) {
-+    if (!ever_connected && now - boot_ms > JOIN_TIMEOUT) { startSetup(false); return; }
-+    if (lost_since && ever_connected && now - lost_since > LOST_TIMEOUT) { startSetup(false); return; }
-+    if (now - last_retry > RETRY_EVERY) joinSaved();
++    if (haveSaved() && !usableCount()) { startSetup(false); return; }   // wrong password: no point waiting out the timeouts
++    if (!ever_connected && since(boot_ms) > JOIN_TIMEOUT) { startSetup(false); return; }
++    if (lost_since && ever_connected && since(lost_since) > LOST_TIMEOUT) { startSetup(false); return; }
++    if (since(last_retry) > RETRY_EVERY) joinSaved();
 +  }
 +}
 +

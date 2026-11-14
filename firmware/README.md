@@ -85,6 +85,9 @@ misbehaves still needs USB to recover.
   password and set the hostname. It opens:
   - when no network is saved;
   - when the saved one doesn't connect within 45 s of boot, or is lost for 10 minutes;
+  - straight away when every saved network has refused its password. A network that refuses the password
+    three times in a row isn't tried again until you change its password (or the hotspot's 10-minute retry,
+    below), since every attempt takes the radio off the hotspot's channel. The setup page names it;
   - when you **hold the button while plugging the radio in** (about 2 s). That's the button's only job on this
     screenless kit: without a display the firmware's menu presses are ignored, since pressing through an
     invisible menu could switch Bluetooth off or put the radio to sleep;
