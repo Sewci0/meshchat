@@ -4,7 +4,7 @@
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { useLocal } from "@/lib/local"
-import { ago, bearing, clock, km, snrQuality } from "@/lib/mesh"
+import { ago, bearing, km, snrQuality, clockOrDay } from "@/lib/mesh"
 import { useAppState, useQuietRepeater, useRadioSf } from "@/lib/queries"
 import type { RepeaterQuiet } from "@/lib/types"
 import { TriangleAlertIcon, XIcon } from "lucide-react"
@@ -34,7 +34,7 @@ export function QuietRepeaterAlert({ quiet, snr, yours }: { quiet: RepeaterQuiet
   return (
     <Alert className="border-amber-500/40">
       <TriangleAlertIcon className={AMBER} />
-      <AlertTitle>Silent since {clock(quiet.since)} ({ago(quiet.since)})</AlertTitle>
+      <AlertTitle>Silent since {clockOrDay(quiet.since)} ({ago(quiet.since)})</AlertTitle>
       <AlertDescription className="grid gap-1.5">
         <p>
           Nothing has come straight from it since then, though at its usual rate about {quiet.expected} of
@@ -60,7 +60,7 @@ export function QuietRepeaterBar() {
     <div role="status" className="flex items-start gap-2.5 border-t bg-background px-3 py-2 text-sm">
       <TriangleAlertIcon className={`mt-0.5 size-4 shrink-0 ${AMBER}`} aria-hidden />
       <p className="min-w-0 flex-1 text-muted-foreground">
-        Your repeater <span className="font-medium text-foreground">{q.name}</span> has been silent since {clock(q.quiet.since)}:
+        Your repeater <span className="font-medium text-foreground">{q.name}</span> has been silent since {clockOrDay(q.quiet.since)}:
         messages may not get through.{" "}
         <Link to={`/repeaters/${q.key}`} className="whitespace-nowrap text-foreground underline underline-offset-3">What to do</Link>
       </p>

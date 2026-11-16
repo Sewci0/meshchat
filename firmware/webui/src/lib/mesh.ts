@@ -43,6 +43,13 @@ export function ago(sec?: number | null) {
 }
 
 export const clock = (sec: number) => new Date(sec * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+/** The time today; on another day the date too, so an old time can't pass for today's. */
+export const clockOrDay = (sec: number) => {
+  const d = new Date(sec * 1000)
+  return d.toDateString() === new Date().toDateString()
+    ? clock(sec)
+    : d.toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
+}
 export const dayLabel = (sec: number) => {
   const d = new Date(sec * 1000), today = new Date()
   const y = new Date(); y.setDate(today.getDate() - 1)

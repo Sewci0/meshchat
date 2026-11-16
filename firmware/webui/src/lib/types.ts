@@ -283,6 +283,8 @@ export interface RepeaterSummary {
   last_hop: number
   uncertain_share: number
   direct: boolean
+  /** heard straight from it in the last hour: a neighbour now, not one that once was */
+  direct_now: boolean
   snr_median: number | null
   people: number
   nodes: number

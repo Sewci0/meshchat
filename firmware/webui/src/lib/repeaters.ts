@@ -38,6 +38,8 @@ export interface Analysis {
   reps: Map<string, Cand>; stats: Map<string, Stat>; unknown: number; packets: number; since: number | null
   /** when each counted packet arrived */
   times: number[]
+  /** your channel messages' first repeater (the one that passed each on first), with when you sent it */
+  own: { ts: number; key: string }[]
 }
 
 const isRep = (t: NodeType | undefined) => t === "repeater" || t === "room"
@@ -130,6 +132,7 @@ export function analyse(inp: AnalysisInput, days: number, now = Date.now() / 100
 
   let counted = 0, oldest: number | null = null
   const times: number[] = []
+  const own: { ts: number; key: string }[] = []
   for (let p = inp.packets.length - 1; p >= 0; p--) {   // oldest first, like ORDER BY id
     const r = inp.packets[p]
     if (r.ts <= since) continue
@@ -187,7 +190,7 @@ export function analyse(inp: AnalysisInput, days: number, now = Date.now() / 100
     const res = resolve(splitPath(m.path, m.hash_size), reps, cache, home)
     if (!res[0]) continue
     const s = S(res[0].key)
-    if (m.out) { s.heard_you.count++; s.heard_you.last_ts = Math.max(s.heard_you.last_ts, m.ts) }
+    if (m.out) { s.heard_you.count++; s.heard_you.last_ts = Math.max(s.heard_you.last_ts, m.ts); own.push({ ts: m.ts, key: res[0].key }) }
     else user(s, null, m.sender, null, m.ts, res[0].unc, "channel")
   }
 
@@ -204,7 +207,7 @@ export function analyse(inp: AnalysisInput, days: number, now = Date.now() / 100
       s.people.delete(nk)
     }
   }
-  return { reps, stats, unknown, packets: counted, since: oldest, times }
+  return { reps, stats, unknown, packets: counted, since: oldest, times, own }
 }
 
 const emptyStat = (): Stat => ({ relayed: 0, first_hop: 0, last_hop: 0, uncertain: 0, last_ts: 0, snr: [], people: new Map(),
@@ -220,6 +223,10 @@ function heardDirect(s: Stat, r: Packet) {
   s.signal.push({ ts: r.ts, snr: r.snr, rssi: r.rssi, type: r.type })
 }
 
+/** how long a repeater counts as heard directly after the last packet straight from it: neighbours are
+ *  heard every few minutes, the quiet ones within the hour, while you're listening */
+export const DIRECT_TIMEOUT_S = 3600
+
 function summary(key: string, rep: Partial<Cand>, s: Stat, home: { lat: number; lon: number }): RepeaterSummary {
   const snr = [...s.snr].sort((a, b) => a - b)
   return {
@@ -228,7 +235,7 @@ function summary(key: string, rep: Partial<Cand>, s: Stat, home: { lat: number; 
     km: located(rep) ? round(km(home, rep), 1) : null,
     relayed: s.relayed, first_hop: s.first_hop, last_hop: s.last_hop,
     uncertain_share: s.relayed ? round(s.uncertain / s.relayed, 2) : 0,
-    direct: s.last_hop > 0, snr_median: snr.length ? snr[Math.floor(snr.length / 2)] : null,
+    direct: s.last_hop > 0, direct_now: s.last_hop > 0 && Date.now() / 1000 - s.last_direct < DIRECT_TIMEOUT_S, snr_median: snr.length ? snr[Math.floor(snr.length / 2)] : null,
     people: s.people.size, nodes: s.nodes.size, links: s.links.size, last_ts: s.last_ts, hourly: s.hourly,
   }
 }
@@ -236,14 +243,18 @@ function summary(key: string, rep: Partial<Cand>, s: Stat, home: { lat: number; 
 /** A repeater gone quiet: one you heard straight from regularly (10+ packets), then nothing from it
  *  for a while, though so much else arrived that, at its usual share of what you hear, a good
  *  number of those packets should have been its own. That points at the repeater (switched off,
- *  broken, reconfigured), not at a quiet mesh. */
-export const QUIET_AFTER_S = 15 * 60, QUIET_MIN_HEARD = 10, QUIET_EXPECTED = 8, QUIET_NEXT_S = 30 * 60
+ *  broken, reconfigured), not at a quiet mesh. Only the last 2 hours' traffic counts (QUIET_WINDOW_S):
+ *  what the log held days ago, or before a gap when nothing was listening, says nothing about now. */
+export const QUIET_AFTER_S = 15 * 60, QUIET_MIN_HEARD = 10, QUIET_EXPECTED = 8, QUIET_NEXT_S = 30 * 60, QUIET_WINDOW_S = 2 * 3600
 
 function quiet(a: Analysis, key: string, now: number): RepeaterQuiet | null {
   const s = a.stats.get(key)
   if (!s || s.last_hop < QUIET_MIN_HEARD || now - s.last_direct < QUIET_AFTER_S) return null
   let before = 0, after = 0
-  for (const t of a.times) if (t > s.last_direct) after++; else before++
+  for (const t of a.times) {
+    if (t <= s.last_direct) before++
+    else if (t > now - QUIET_WINDOW_S) after++
+  }
   const expected = before ? (s.last_hop / before) * after : 0
   if (expected < QUIET_EXPECTED) return null
   // the repeater that reaches you best now: the last half hour, at least 3 packets straight from it
@@ -268,15 +279,21 @@ export function repeaterList(a: Analysis, inp: AnalysisInput, days: number, now 
     your_repeater_quiet: yours ? quiet(a, yours.key, now) : null, repeaters: out, unknown_hops: a.unknown, coverage: { packets: a.packets, since: a.since, held: inp.packets.length } }
 }
 
-/** "Your" repeater: the one that most often passed on your messages first, so it demonstrably hears
- *  you (the latest on a tie). With none in this period, the one you hear most packets from directly. */
+/** how many of your latest messages decide which repeater is yours */
+export const YOURS_FROM = 5
+
+/** "Your" repeater: the one that passed on most of your last 5 messages first (the latest on a tie), so
+ *  it demonstrably hears you now; counting the whole period kept one that used to carry them after
+ *  another took over. With none in this period, the one you hear most packets from directly. */
 function pickYours(a: Analysis, out: RepeaterSummary[]) {
-  let best: [string, Stat] | null = null
-  for (const [k, s] of a.stats) {
-    const h = s.heard_you, b = best?.[1].heard_you
-    if (h.count && (!b || h.count > b.count || (h.count === b.count && h.last_ts > b.last_ts))) best = [k, s]
+  const tally = new Map<string, { count: number; last: number }>()
+  for (const o of [...a.own].sort((x, y) => y.ts - x.ts).slice(0, YOURS_FROM)) {
+    const t = tally.get(o.key) ?? { count: 0, last: 0 }
+    tally.set(o.key, { count: t.count + 1, last: Math.max(t.last, o.ts) })
   }
-  if (best) return { key: best[0], basis: "passes_yours" as const, passed: best[1].heard_you.count }
+  let best: [string, { count: number; last: number }] | null = null
+  for (const [k, t] of tally) if (!best || t.count > best[1].count || (t.count === best[1].count && t.last > best[1].last)) best = [k, t]
+  if (best) return { key: best[0], basis: "passes_yours" as const, passed: a.stats.get(best[0])?.heard_you.count ?? best[1].count }
   let most: RepeaterSummary | null = null
   for (const r of out) if (!most || r.last_hop > most.last_hop) most = r
   return most && most.last_hop ? { key: most.key, basis: "heard_most" as const, passed: 0 } : null

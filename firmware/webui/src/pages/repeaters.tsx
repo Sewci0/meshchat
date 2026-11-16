@@ -100,7 +100,8 @@ function RepeaterList({ list, mine, mineQuiet, selected, loading }: {
 }) {
   const [q, setQ] = useState("")
   const filtered = useMemo(() => (list ?? []).filter((r) => !q || fold(r.name).includes(fold(q))), [list, q])
-  const direct = filtered.filter((r) => r.direct), far = filtered.filter((r) => !r.direct)
+  // heard directly: in the last hour; the rest (some heard straight from earlier) further along
+  const direct = filtered.filter((r) => r.direct_now), far = filtered.filter((r) => !r.direct_now)
   const section = (title: string, rows: RepeaterSummary[]) => rows.length ? (
     <section>
       <h2 className="px-3 pt-3 pb-1 text-xs font-medium text-muted-foreground">{title} · {rows.length}</h2>
