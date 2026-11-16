@@ -52,6 +52,46 @@ public final class AppModel {
     @ObservationIgnored private var batteryAt = Date.distantPast
     public private(set) var contacts: [PublicKey: Contact] = [:]
     public private(set) var channels: [ChannelInfo] = []
+    /// The radio's channels and contacts are known: synced from it, or as it last had them (`radioCache`).
+    /// Until then a chat list would be half-known (no channels, people by key, rooms as people).
+    public private(set) var radioKnown = false
+
+    // MARK: the radio as last synced
+
+    /// Where the radio's channels and contacts are kept between launches, one file per radio, so the lists
+    /// are right from the first moment (before the radio answers, or out of its range). Off (nil) unless
+    /// set: the app sets it; tests and the demo keep nothing.
+    @ObservationIgnored public var radioCacheDirectory: URL?
+    /// how long after the last change the cache is written (contacts change with every advert)
+    @ObservationIgnored public var radioCacheDelay: Duration = .seconds(3)
+    @ObservationIgnored private var radioCacheWrite: Task<Void, Never>?
+
+    private struct RadioCache: Codable { var channels: [ChannelInfo]; var contacts: [Contact] }
+
+    private func radioCacheFile(_ r: SavedRadio) -> URL? {
+        radioCacheDirectory?.appendingPathComponent(String(r.key.map { $0.isLetter || $0.isNumber ? $0 : "_" }) + ".json")
+    }
+
+    /// Shows the radio as it was last synced, if it's kept, until the radio itself answers.
+    public func restoreRadioCache() {
+        guard !isDemo, let r = savedRadio, let file = radioCacheFile(r),
+              let data = try? Data(contentsOf: file), let cache = try? JSONDecoder().decode(RadioCache.self, from: data) else { return }
+        channels = cache.channels
+        contacts = Dictionary(cache.contacts.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
+        radioKnown = true
+    }
+
+    private func keepRadioCache() {
+        guard !isDemo, let r = savedRadio, let file = radioCacheFile(r), !(channels.isEmpty && contacts.isEmpty) else { return }
+        let cache = RadioCache(channels: channels, contacts: Array(contacts.values)), delay = radioCacheDelay
+        radioCacheWrite?.cancel()
+        radioCacheWrite = Task.detached(priority: .utility) {
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled, let data = try? JSONEncoder().encode(cache) else { return }
+            try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        }
+    }
     public private(set) var listened: [ListenedChannel] = []
     public private(set) var rooms: [String: RoomMembership] = [:]
     public private(set) var conversations: [ConversationID: ConversationSummary] = [:]
@@ -131,7 +171,10 @@ public final class AppModel {
         didSet { defaults.set(autoReconnect, forKey: "autoReconnect") }
     }
 
-    public func forget(_ radio: SavedRadio) { recentRadios.removeAll { $0.key == radio.key } }
+    public func forget(_ radio: SavedRadio) {
+        recentRadios.removeAll { $0.key == radio.key }
+        if let file = radioCacheFile(radio) { try? FileManager.default.removeItem(at: file) }   // and what was kept of it
+    }
 
     /// People you've blocked: their messages are hidden here and don't notify (see BlockList).
     public private(set) var blockList = BlockList() {
@@ -152,6 +195,8 @@ public final class AppModel {
     public var openConversation: ConversationID?
     /// a point to centre the map on
     public var mapFocus: String?
+    /// with `mapFocus`: show that repeater's links (only it and the repeaters at their other ends)
+    public var mapShowsLinks = false
     /// a message's route to draw on the map, instead of every node
     public var mapRoute: MapRoute?
     /// a repeater to show in Repeaters
@@ -163,32 +208,42 @@ public final class AppModel {
     /// Conversations with unread messages (the Chats tab badge).
     public var unreadCount: Int { conversations.keys.filter { isUnread($0) && !isLeftRoom($0) && !blockList.hides($0) }.count }
 
+    /// A room that's off the chat list: one you left, or one the radio no longer has as a contact (removed
+    /// there, by another app or by the radio making room), which it can neither hear nor post to.
     func isLeftRoom(_ c: ConversationID) -> Bool {
-        if case .direct(let k) = c { return rooms[k.hex]?.left == true }
-        return false
+        guard case .direct(let k) = c else { return false }
+        if rooms[k.hex]?.left == true { return true }
+        return isRoom(c) && contacts[k] == nil && !contacts.isEmpty
     }
 
     public func open(_ c: ConversationID) { openConversation = c; tab = .chats }
-    public func showOnMap(_ id: String) { mapRoute = nil; mapFocus = id; tab = .map }
+    public func showOnMap(_ id: String) { mapRoute = nil; mapShowsLinks = false; mapFocus = id; tab = .map }
+    public func showLinksOnMap(_ key: String) { mapRoute = nil; mapShowsLinks = true; mapFocus = key; tab = .map }
     public func showRoute(_ route: MapRoute) { mapRoute = route; mapFocus = nil; tab = .map }
     public func showRepeater(_ key: String) { repeaterFocus = key; tab = .repeaters }
 
-    @ObservationIgnored private var analyses: [String: (version: Int, task: Task<RepeaterAnalysis, Never>)] = [:]
+    @ObservationIgnored private var analyses: [String: (packets: Int, at: TimeInterval, origin: Position?, task: Task<RepeaterAnalysis, Never>)] = [:]
 
     /// The packet log of the last `days` on the radio's network, worked out off the main thread: shared by
-    /// the Repeaters tab, a repeater's page and the map (callers at the same time share one run), and
-    /// worked out again only after another 25 packets.
+    /// the Repeaters tab, a repeater's page and the map (callers at the same time share one run). Worked
+    /// out again once packets have arrived since, but at most every 10 s, and after a minute anyway: what
+    /// it says depends on the time too (gone quiet, the last 3 hours' activity). At once when home moves:
+    /// distances, and which repeater a shared ID names, are measured from it.
     public func repeaterAnalysis(days: Int) async -> RepeaterAnalysis {
-        let version = packetVersion / 25
         let id = "\(days)/\(network ?? "")"
-        if let a = analyses[id], a.version == version { return await a.task.value }
+        let now = Date.now.timeIntervalSince1970
+        if let a = analyses[id], a.origin == distanceOrigin {
+            let age = now - a.at
+            if age < 10 || (a.packets == packetVersion && age < 60) { return await a.task.value }
+        }
+        let version = packetVersion
         let store = store, dir = directory, net = network
         let task = Task.detached(priority: .utility) {
             let since = Date.now.addingTimeInterval(-Double(days) * 86400)
             return RepeaterAnalysis(packets: (try? store.recentPackets(since: since, network: net)) ?? [],
                                     channelRoutes: (try? store.channelRoutes(since: since, network: net)) ?? [], directory: dir, days: days)
         }
-        analyses[id] = (version, task)
+        analyses[id] = (version, now, distanceOrigin, task)
         return await task.value
     }
 
@@ -325,6 +380,11 @@ public final class AppModel {
     /// iOS lets MeshChat show Live Activities (the app keeps it current).
     public var liveActivitiesAllowed = true
 
+    /// Where a link's preview loads by itself (elsewhere: when its card is tapped).
+    public var linkPreviews: LinkPreviewMode = .direct {
+        didSet { defaults.set(linkPreviews.rawValue, forKey: "linkPreviews") }
+    }
+
     /// Sends a reply typed into a notification: reconnects first if the link is down (WiFi drops in the
     /// background), giving up after `timeout`.
     public func reply(_ text: String, to c: ConversationID, timeout: Duration = .seconds(8)) async throws {
@@ -355,6 +415,7 @@ public final class AppModel {
         recentRadios = defaults.data(forKey: "recentRadios").flatMap { try? JSONDecoder().decode([SavedRadio].self, from: $0) } ?? []
         autoReconnect = defaults.object(forKey: "autoReconnect") as? Bool ?? true
         lockScreenStatus = defaults.object(forKey: "lockScreenStatus") as? Bool ?? true
+        linkPreviews = defaults.string(forKey: "linkPreviews").flatMap(LinkPreviewMode.init(rawValue:)) ?? .direct
         keepRunningInBackground = defaults.object(forKey: "keepRunningInBackground") as? Bool ?? true
         let starring = defaults.object(forKey: "starWhatYouUse") as? Bool ?? true
         starWhatYouUse = starring
@@ -366,7 +427,13 @@ public final class AppModel {
     }
 
     /// The app's own model, with its database on disk.
-    public static func live() throws -> AppModel { AppModel(engine: MeshEngine(store: try .onDisk())) }
+    public static func live() throws -> AppModel {
+        let m = AppModel(engine: MeshEngine(store: try .onDisk()))
+        m.radioCacheDirectory = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("RadioCache", isDirectory: true)
+        m.restoreRadioCache()
+        return m
+    }
 
     /// Trying MeshChat without a radio: the demo's simulated radio and made-up mesh (DemoMesh), with its own
     /// history in memory and its own settings, so nothing of yours is read, changed or kept.
@@ -402,6 +469,7 @@ public final class AppModel {
     public var demoShow: String?
 
     public var isConnected: Bool { if case .connected = connection { true } else { false } }
+    public var isConnecting: Bool { if case .connecting = connection { true } else { false } }
 
     /// Makes the link to a saved radio (tests put a simulated radio here).
     public var makeTransport: @MainActor (SavedRadio) -> MeshTransport = { $0.transport() }
@@ -413,6 +481,12 @@ public final class AppModel {
     public private(set) var disconnectedByYou = false
 
     public func connect(_ radio: SavedRadio) async {
+        if radio.key != savedRadio?.key {
+            // another radio: its own lists, as last synced, never the previous radio's
+            channels = []; contacts = [:]; radioKnown = false
+            savedRadio = radio
+            restoreRadioCache()
+        }
         savedRadio = radio
         recentRadios = [radio] + recentRadios.filter { $0.key != radio.key }.prefix(4)
         retries = 0
@@ -479,6 +553,7 @@ public final class AppModel {
             case .radio, .channels: await pullRadio()
             case .contacts:
                 contacts = await engine.contacts
+                keepRadioCache()
                 // room again (after tidying, or making room): the notice has done its job
                 if let max = device?.maxContacts, contacts.count < max * 95 / 100 { contactsFullNotice = false }
             case .contactsFull: contactsFullNotice = true
@@ -501,6 +576,7 @@ public final class AppModel {
     private func pullRadio() async {
         let s = await engine.snapshot
         me = s.me; device = s.device; channels = s.channels; contacts = s.contacts
+        if s.me != nil { radioKnown = true; keepRadioCache() }
         if let me = s.me { radioPosition = me.position; network = NetworkKey(me.radio).key }
         listened = (try? store.listened()) ?? []
     }
@@ -585,7 +661,8 @@ public final class AppModel {
         switch c {
         case .channel(let i): channels.first { $0.index == i }?.name ?? String(localized: "Channel \(i)")
         case .listened(let n): n
-        case .direct(let k): contacts[k]?.name ?? String(k.hex.prefix(8))
+        // no longer a contact (removed, or dropped by the radio): the name it was last heard with
+        case .direct(let k): contacts[k]?.name ?? heard.first { $0.key == k.hex }?.name ?? String(k.hex.prefix(8))
         }
     }
 
@@ -605,16 +682,19 @@ public final class AppModel {
         onRead?(c)
     }
 
+    /// A room: by its contact, or, once that's gone from the radio, by having been joined or heard as one
+    /// (its posts must not turn into a direct message with a person).
     public func isRoom(_ c: ConversationID) -> Bool {
-        if case .direct(let k) = c { return contacts[k]?.type == .room }
-        return false
+        guard case .direct(let k) = c else { return false }
+        if let contact = contacts[k] { return contact.type == .room }
+        return rooms[k.hex] != nil || heard.contains { $0.key == k.hex && $0.type == Int(NodeType.room.rawValue) }
     }
 
-    /// Rooms joined here (not left) or with posts, newest first.
+    /// Rooms joined here or with posts, that you haven't left and the radio still has, newest first.
     public var roomList: [ConversationID] {
         var keys = Set(rooms.values.filter { !$0.left }.map(\.key))
-        for c in conversations.keys { if case .direct(let k) = c, contacts[k]?.type == .room, rooms[k.hex]?.left != true { keys.insert(k.hex) } }
-        return keys.compactMap { PublicKey(hex: $0) }.map { ConversationID.direct($0) }.sorted { latest($0) > latest($1) }
+        for c in conversations.keys { if case .direct(let k) = c, contacts[k]?.type == .room { keys.insert(k.hex) } }
+        return keys.compactMap { PublicKey(hex: $0) }.map { ConversationID.direct($0) }.filter { !isLeftRoom($0) }.sorted { latest($0) > latest($1) }
     }
 
     /// Takes a conversation off the chat list. A channel is left on the radio (freeing its slot) and its

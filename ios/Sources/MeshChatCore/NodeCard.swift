@@ -52,7 +52,7 @@ public struct NodeCard: Equatable, Sendable {
         case .home: String(localized: "Your home location")
         }
         tags = (isYours ? [String(localized: "Your repeater")] : []) + (!p.isContact && !isHome ? [String(localized: "Not a contact")] : [])
-        quiet = quietSince.map { String(localized: "Gone quiet since \($0.formatted(date: .omitted, time: .shortened))") }
+        quiet = quietSince.map { String(localized: "Gone quiet since \($0.timeOrDay(now: now))") }
 
         var stats: [Stat] = []
         func relays(_ s: RepeaterAnalysis.Summary) {
@@ -126,12 +126,18 @@ public struct NodeCard: Equatable, Sendable {
 
 /// A repeater's links to its neighbours, as lines on the map: the busiest few with a known position.
 public enum MapLinks {
-    public static func lines(from key: String, analysis: RepeaterAnalysis, limit: Int = 6) -> [[Position]] {
-        guard let here = analysis.directory.nodes[key]?.position, let links = analysis.stats[key]?.links else { return [] }
+    /// The repeaters a repeater exchanges the most traffic with, that are on the map: the ends of its lines.
+    public static func linked(from key: String, analysis: RepeaterAnalysis, limit: Int = 6) -> [String] {
+        guard analysis.directory.nodes[key]?.position != nil, let links = analysis.stats[key]?.links else { return [] }
         return links.values
             .sorted { ($0.to + $0.from, $1.key) > ($1.to + $1.from, $0.key) }
-            .compactMap { l in analysis.directory.nodes[l.key]?.position.map { [here, $0] } }
+            .filter { analysis.directory.nodes[$0.key]?.position != nil }
             .prefix(limit)
-            .map { $0 }
+            .map(\.key)
+    }
+
+    public static func lines(from key: String, analysis: RepeaterAnalysis, limit: Int = 6) -> [[Position]] {
+        guard let here = analysis.directory.nodes[key]?.position else { return [] }
+        return linked(from: key, analysis: analysis, limit: limit).compactMap { k in analysis.directory.nodes[k]?.position.map { [here, $0] } }
     }
 }

@@ -62,6 +62,7 @@ struct SettingsView: View {
                         LabeledContent("Blocked", value: model.blockList.entries.isEmpty ? String(localized: "None") : "\(model.blockList.entries.count)")
                     }
                 }
+                LinkPreviewSetting()
                 Section {
                     LabeledContent("Version", value: Self.version)
                     Link(destination: Self.privacyPolicy) { Label("Privacy policy", systemImage: "hand.raised.square") }
@@ -138,6 +139,22 @@ private struct NodeHeader: View {
 
 /// `ConnectionNotice` as a form's first section: there only while the radio isn't connected, so it
 /// explains the greyed-out buttons below and offers to reconnect.
+/// Where link previews load by themselves, and what loading one gives away.
+struct LinkPreviewSetting: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        Section {
+            Picker("Link previews", selection: $model.linkPreviews) {
+                ForEach(LinkPreviewMode.allCases, id: \.self) { Text($0.label).tag($0) }
+            }
+        } footer: {
+            Text("A preview is fetched from the link's website, which sees your internet address, and on the mesh anyone can post a link. Where previews don't load by themselves, tap a link's card to load one.")
+        }
+    }
+}
+
 struct ConnectionNoticeSection: View {
     @Environment(AppModel.self) private var model
 
@@ -178,6 +195,9 @@ struct NodeIdentityView: View {
                 Button("Announce nearby") { run(String(localized: "Announced to the radios that hear you directly.")) { try await model.engine.sendAdvert(flood: false) } }
                     .disabled(!model.isConnected)
                 Button("Announce to the whole mesh…") { confirmAdvert = true }
+                    .confirmationDialog("Announce “\(model.me?.name ?? name)” to the whole mesh?", isPresented: $confirmAdvert, titleVisibility: .visible) {
+                        Button("Announce") { run(String(localized: "Announced to the whole mesh.")) { try await model.engine.sendAdvert(flood: true) } }
+                    } message: { Text(floodMessage) }
                     .disabled(!model.isConnected)
             } header: { Text("Announce yourself") } footer: {
                 Text(sharesPosition
@@ -189,11 +209,6 @@ struct NodeIdentityView: View {
         .navigationTitle("Your node")
         .onAppear(perform: seed)
         .onChange(of: model.me?.name) { seed() }
-        .confirmationDialog("Announce “\(model.me?.name ?? name)” to the whole mesh?", isPresented: $confirmAdvert, titleVisibility: .visible) {
-            Button("Announce") { run(String(localized: "Announced to the whole mesh.")) { try await model.engine.sendAdvert(flood: true) } }
-        } message: {
-            Text(floodMessage)
-        }
         .sheet(isPresented: $showCode) { ContactCodesView() }
         .alert(message ?? "", isPresented: .present($message)) { Button("OK") {} }
     }

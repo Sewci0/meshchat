@@ -360,6 +360,23 @@ public struct LoginResult: Hashable, Sendable {
     public let firmwareLevel: UInt8?
 }
 
+/// What the radio says of itself (companion protocol 8 and later): how long it has been up, what waits
+/// to be sent, the noise it hears between packets, and how long it has spent sending and receiving
+/// since it started.
+public struct RadioStats: Hashable, Sendable {
+    public var uptimeSeconds: Int
+    public var queued: Int
+    /// dBm
+    public var noiseFloor: Int
+    public var txAirSeconds: Int
+    public var rxAirSeconds: Int
+
+    public init(uptimeSeconds: Int, queued: Int, noiseFloor: Int, txAirSeconds: Int, rxAirSeconds: Int) {
+        self.uptimeSeconds = uptimeSeconds; self.queued = queued; self.noiseFloor = noiseFloor
+        self.txAirSeconds = txAirSeconds; self.rxAirSeconds = rxAirSeconds
+    }
+}
+
 public struct BatteryInfo: Hashable, Sendable {
     public let millivolts: Int
     public let storageUsedKB: Int

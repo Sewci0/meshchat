@@ -43,3 +43,26 @@ public struct MeshPulse: Sendable, Equatable {
         return margin >= 10 ? 3 : margin >= 5 ? 2 : margin > 0 ? 1 : 0
     }
 }
+
+/// People heard lately, for the lock screen: whether the mesh is alive right now. Those who wrote (in a
+/// channel, a room or a direct message) and those whose advert arrived, each counted once however their
+/// name is spelt (channel messages carry only a name, adverts a key too), and never you.
+public enum PeopleHeard {
+    public static let window: TimeInterval = 3600
+
+    /// Whether a message that arrived in the window was also written in it. Messages the radio kept while
+    /// the phone was away, and a room's older posts, arrive late: the sender's clock says when they were
+    /// written, if it's plausibly right (within a day of ours; a clock never set doesn't decide).
+    public static func writtenLately(senderTimestamp: UInt32?, now: Date = .now) -> Bool {
+        guard let ts = senderTimestamp else { return true }
+        let age = now.timeIntervalSince1970 - Double(ts)
+        return abs(age) > 86400 || age <= window + 600
+    }
+
+    /// - writers: the senders of messages that arrived in the window
+    /// - advertisers: the names of people (not repeaters, rooms or sensors) whose advert arrived in it
+    public static func count(writers: [String], advertisers: [String], me: String?) -> Int {
+        let mine = me.map(Mentions.normalized)
+        return Set((writers + advertisers).map(Mentions.normalized).filter { !$0.isEmpty && $0 != mine }).count
+    }
+}

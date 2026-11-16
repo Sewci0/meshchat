@@ -31,6 +31,12 @@ extension EngineTests {
         await #expect(throws: MeshEngine.EngineError.noFreeChannelSlot) { try await engine.joinChannel(name: "#full") }
     }
 
+    @Test func theRadioTellsItsOwnNumbers() async throws {
+        let (engine, _) = try await setUp()
+        let s = try await engine.radioStats()
+        #expect(s == RadioStats(uptimeSeconds: 172_800, queued: 0, noiseFloor: -112, txAirSeconds: 540, rxAirSeconds: 10_800))
+    }
+
     @Test func addingAndRemovingContacts() async throws {
         let (engine, radio) = try await setUp()
         let bob = PublicKey(Data(repeating: 0xE5, count: 32))!

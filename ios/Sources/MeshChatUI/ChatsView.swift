@@ -18,26 +18,30 @@ struct ChatsView: View {
         NavigationSplitView {
             List(selection: $selection) {
                 if model.savedRadio != nil, !model.isConnected { Section { ConnectionNotice() } }
-                Section("Channels") {
-                    ForEach(model.channels, id: \.index) { ch in
-                        row(.channel(ch.index), icon: "number", title: ch.name.hasPrefix("#") ? String(ch.name.dropFirst()) : ch.name)
+                // the first connection to a radio, nothing of it kept yet: its channels and contacts are still
+                // on their way, and the lists would be half-known (no channels, people by key, rooms as people)
+                if model.radioKnown || !model.isConnecting {
+                    Section("Channels") {
+                        ForEach(model.channels, id: \.index) { ch in
+                            row(.channel(ch.index), icon: "number", title: ch.name.hasPrefix("#") ? String(ch.name.dropFirst()) : ch.name)
+                        }
                     }
-                }
-                if !model.listened.isEmpty {
-                    Section("Listening") {
-                        ForEach(model.listened, id: \.name) { l in row(.listened(l.name), icon: "ear", title: String(l.name.dropFirst())) }
+                    if !model.listened.isEmpty {
+                        Section("Listening") {
+                            ForEach(model.listened, id: \.name) { l in row(.listened(l.name), icon: "ear", title: String(l.name.dropFirst())) }
+                        }
                     }
-                }
-                Section("Rooms") {
-                    ForEach(model.roomList, id: \.self) { c in row(c, icon: "person.3", title: model.title(of: c)) }
-                    Button { browsingRooms = true } label: {
-                        Label("Browse rooms heard nearby", systemImage: "magnifyingglass")
+                    Section("Rooms") {
+                        ForEach(model.roomList, id: \.self) { c in row(c, icon: "person.3", title: model.title(of: c)) }
+                        Button { browsingRooms = true } label: {
+                            Label("Browse rooms heard nearby", systemImage: "magnifyingglass")
+                        }
                     }
-                }
-                Section("Direct messages") {
-                    ForEach(model.directList, id: \.self) { c in row(c, icon: nil, title: model.title(of: c)) }
-                    if model.directList.isEmpty {
-                        Text("Start one from + › New message, or touch and hold a message in a channel.").font(.footnote).foregroundStyle(.secondary)
+                    Section("Direct messages") {
+                        ForEach(model.directList, id: \.self) { c in row(c, icon: nil, title: model.title(of: c)) }
+                        if model.directList.isEmpty {
+                            Text("Start one from + › New message, or touch and hold a message in a channel.").font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
                 }
             }

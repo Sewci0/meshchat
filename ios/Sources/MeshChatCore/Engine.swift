@@ -125,6 +125,7 @@ public actor MeshEngine {
             connecting = nil
             setState(.connected(transport.label))
             publish(.radio); publish(.channels)
+            relinkChannelMessages()
             inBacklog = true
             await drainQueue()
             inBacklog = false
@@ -225,9 +226,24 @@ public actor MeshEngine {
     }
 
     public func removeContact(_ key: PublicKey) async throws {
-        try await connected().remove(key)
+        let c = try connected()
+        await leaveIfRoom(key)
+        try await c.remove(key)
         contacts[key] = nil
         publish(.contacts)
+    }
+
+    /// A room about to be taken off the radio's contacts is left first: without the contact the radio can
+    /// neither hear it nor post to it, so it shouldn't stay on the chat list as a room you're in. Its
+    /// posts stay on this device, and joining again from Browse rooms brings it back.
+    private func leaveIfRoom(_ key: PublicKey) async {
+        guard contacts[key]?.type == .room else { return }
+        var r = (try? store.room(key.hex)) ?? RoomMembership(key: key.hex, left: false, admin: false)
+        guard !r.left else { return }
+        if r.joined != nil || r.loginAt != nil { try? await client?.logout(key) }
+        r.left = true; r.leftAt = .now
+        try? store.save(r)
+        publish(.rooms)
     }
 
     /// Removes these contacts in turn (the radio has no command for several), as ordered; `progress` gets
@@ -240,6 +256,7 @@ public actor MeshEngine {
         defer { publish(.contacts) }
         for key in keys {
             if Task.isCancelled { break }
+            await leaveIfRoom(key)
             do { try await c.remove(key) } catch RadioError.notFound {}
             contacts[key] = nil
             done += 1
@@ -323,6 +340,8 @@ public actor MeshEngine {
                               status: .received, hops: m.floodHops, hashSize: m.pathHashSize, snr: m.snr, network: network)
             if let heard = recentChannelPackets.last(where: { $0.channel == m.channelIndex && $0.timestamp == m.senderTimestamp && $0.text == m.text }) {
                 link(&msg, to: heard.packet)
+            } else if let p = loggedPacket(channel: m.channelIndex, timestamp: m.senderTimestamp, text: m.text, near: .now) {
+                link(&msg, to: p)   // logged while connecting, before the channels were known to read it
             }
             insertIncoming(msg)
         case .contact(let m):
@@ -353,6 +372,34 @@ public actor MeshEngine {
             }
             insertIncoming(msg)
         }
+    }
+
+    /// A channel message's packet from the log, read with the channel's key: for one logged before the
+    /// channels were loaded (packets are logged from the first moment of a connection, the channels come
+    /// a moment later), which `groupText` couldn't read then. Looks up to 2 minutes before `near`.
+    private func loggedPacket(channel: Int, timestamp: UInt32, text: String, near: Date) -> PacketRecord? {
+        guard let ch = channels.first(where: { $0.index == channel }),
+              let packets = try? store.channelPackets(hash: Int(ch.hash), from: near.addingTimeInterval(-120), to: near.addingTimeInterval(5))
+        else { return nil }
+        return packets.first { p in
+            guard let packet = MeshPacket(raw: p.raw), let plain = ChannelCrypto.decryptGroupText(packet.payload, key: ch.secret) else { return false }
+            return plain.timestamp == timestamp && plain.text == text
+        }
+    }
+
+    /// Gives channel messages saved without their packet the one the log has, if it does (see
+    /// `loggedPacket`). Those that came from the radio's queue while nothing was listening have none.
+    private func relinkChannelMessages() {
+        guard let unlinked = try? store.unlinkedChannelMessages(since: .now - 30 * 86400) else { return }
+        var changed = Set<ConversationID>()
+        for var m in unlinked {
+            guard case .channel(let i) = m.conversation, let ts = m.senderTimestamp else { continue }
+            let full = m.sender.map { "\($0): \(m.text)" } ?? m.text
+            guard let p = loggedPacket(channel: i, timestamp: ts, text: full, near: m.date) else { continue }
+            link(&m, to: p)
+            if (try? store.update(m)) != nil { changed.insert(m.conversation) }
+        }
+        for c in changed { publish(.messages(c)) }
     }
 
     private func link(_ m: inout Message, to p: PacketRecord) {
@@ -912,6 +959,7 @@ public actor MeshEngine {
     public func factoryReset() async throws { try await connected().factoryReset() }
 
     public func battery() async throws -> BatteryInfo { try await connected().battery() }
+    public func radioStats() async throws -> RadioStats { try await connected().stats() }
 
     /// Sets the Bluetooth pairing PIN (paired phones keep working; new ones need it). Rejects a PIN the
     /// radio would refuse before sending it.

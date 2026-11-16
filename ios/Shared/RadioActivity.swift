@@ -34,6 +34,12 @@ struct RadioActivityAttributes: ActivityAttributes {
             var at: Date
             /// true: it got through; false: it didn't; nil: still waiting
             var ok: Bool?
+            /// where it went: the channel, room or person
+            var to: String?
+            /// how it went, in full: "repeated ×3", "delivered in 3.4 s", "not heard · 3 tries"
+            var detail: String?
+            /// what you wrote (nil when notifications hide message text)
+            var text: String?
         }
 
         var link: Link
@@ -60,6 +66,13 @@ struct RadioActivityAttributes: ActivityAttributes {
         /// the radio's battery (nil on USB power)
         var batteryMv: Int?
         var sent: Sent?
+        /// people heard in the last hour: who wrote, or whose advert arrived
+        var people: Int?
+        /// the radio's own numbers: the share of its time spent sending and receiving since it started, and
+        /// when that was
+        var txShare: Double?
+        var rxShare: Double?
+        var upSince: Date?
     }
 
     /// the radio's name or address

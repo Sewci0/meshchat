@@ -1,15 +1,17 @@
 import Foundation
 
-/// Writing mentions: MeshCore apps write them "@[Name]", which is awkward to type on a phone (the
-/// brackets, and names with emoji or spaces). Type "@" and a few letters, pick the person, and the
-/// draft gets the full "@[Name] ".
+/// Writing mentions: MeshCore apps send them as "@[Name]", which is awkward to type on a phone (the
+/// brackets, and names with emoji or spaces). Type "@" and a few letters, pick the person, and the draft
+/// gets "@Name ", shown as in the bubbles; the names picked are kept alongside the draft, and `wire`
+/// puts the brackets back when it's sent.
 extension Mentions {
     /// The mention being typed at the end of a draft: "hi @an" gives "an", "@[Ania K" gives "Ania K", a
-    /// lone "@" gives "". Nil when there's none (no "@", a finished "@[Name]", a space after the word,
-    /// or an "@" inside a word, as in an email address).
-    public static func typing(in draft: String) -> String? {
+    /// lone "@" gives "". Nil when there's none (no "@", a finished "@[Name]" or picked "@Name", a space
+    /// after the word, or an "@" inside a word, as in an email address).
+    public static func typing(in draft: String, picked: [String] = []) -> String? {
         guard let at = draft.lastIndex(of: "@") else { return nil }
         if at > draft.startIndex, !draft[draft.index(before: at)].isWhitespace { return nil }
+        if spans(of: picked, in: draft).contains(where: { $0.lowerBound == at }) { return nil }
         var rest = draft[draft.index(after: at)...]
         if rest.first == "[" {
             rest = rest.dropFirst()
@@ -18,25 +20,58 @@ extension Mentions {
         return rest.contains(where: { $0.isWhitespace || $0 == "]" }) ? nil : String(rest)
     }
 
-    /// The draft with the mention being typed replaced by "@[name] " (or, with none being typed, the
+    /// The draft with the mention being typed replaced by "@name " (or, with none being typed, the
     /// mention added at the end).
     public static func complete(_ draft: String, with name: String) -> String {
         guard typing(in: draft) != nil, let at = draft.lastIndex(of: "@") else { return insert(name, into: draft) }
-        return String(draft[..<at]) + "@[\(name)] "
+        return String(draft[..<at]) + "@\(name) "
     }
 
-    /// "@[name] " added at the end of the draft, unless it's already there.
+    /// "@name " added at the end of the draft, unless it's already there.
     public static func insert(_ name: String, into draft: String) -> String {
-        let tag = "@[\(name)]"
-        if draft.contains(tag) { return draft }
+        let tag = "@" + name
+        if spans(of: [name], in: draft).contains(where: { draft[$0] == tag || draft[$0] == "@[\(name)]" }) { return draft }
         if draft.isEmpty { return tag + " " }
         return draft + (draft.last?.isWhitespace == true ? "" : " ") + tag + " "
     }
 
-    /// The draft ready for a name: an "@" at the end, after a space if it needs one.
-    public static func start(_ draft: String) -> String {
-        if typing(in: draft) != nil { return draft }
-        return draft + (draft.isEmpty || draft.last?.isWhitespace == true ? "@" : " @")
+    /// Where the mentions stand in a draft: each picked name written "@name", and any "@[name]" typed
+    /// out in full. An "@" inside a word (an email address) doesn't start one, and a name followed by a
+    /// letter or digit doesn't count ("@Ann" isn't in "@Anna"); of two picked names, the longer wins.
+    public static func spans(of picked: [String], in draft: String) -> [Range<String.Index>] {
+        let names = picked.filter { !$0.isEmpty }.sorted { $0.count > $1.count }
+        var out: [Range<String.Index>] = []
+        var i = draft.startIndex
+        while let at = draft[i...].firstIndex(of: "@") {
+            let after = draft.index(after: at)
+            i = after
+            if at > draft.startIndex, draft[draft.index(before: at)].isLetter || draft[draft.index(before: at)].isNumber { continue }
+            let rest = draft[after...]
+            if rest.first == "[", let close = rest.firstIndex(of: "]"), !rest[..<close].contains("\n") {
+                let end = draft.index(after: close)
+                out.append(at..<end); i = end
+                continue
+            }
+            for name in names where rest.hasPrefix(name) {
+                let end = draft.index(at, offsetBy: name.count + 1)
+                if end < draft.endIndex, draft[end].isLetter || draft[end].isNumber { continue }
+                out.append(at..<end); i = end
+                break
+            }
+        }
+        return out
+    }
+
+    /// The draft as it's sent: each picked "@name" as MeshCore's "@[name]".
+    public static func wire(_ draft: String, picked: [String]) -> String {
+        var out = "", from = draft.startIndex
+        for span in spans(of: picked, in: draft) {
+            out += draft[from..<span.lowerBound]
+            let tag = draft[span]
+            out += tag.hasPrefix("@[") ? String(tag) : "@[" + tag.dropFirst() + "]"
+            from = span.upperBound
+        }
+        return out + draft[from...]
     }
 
     /// Whom to suggest for `query`: people who wrote here lately first (newest first), then `others`

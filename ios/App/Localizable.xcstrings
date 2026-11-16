@@ -2761,6 +2761,22 @@
         }
       }
     },
+    "A preview is fetched from the link's website, which sees your internet address, and on the mesh anyone can post a link. Where previews don't load by themselves, tap a link's card to load one." : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Náhled se stahuje z webu, na který odkaz vede, a ten uvidí vaši internetovou adresu; v síti mesh může odkaz poslat kdokoli. Kde se náhledy nenačítají samy, načtete je klepnutím na kartu odkazu."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Podgląd jest pobierany ze strony, do której prowadzi link, a ta widzi Twój adres internetowy; w sieci mesh link może wysłać każdy. Tam, gdzie podglądy nie wczytują się same, stuknij kartę linku, aby wczytać podgląd."
+          }
+        }
+      }
+    },
     "A screenshot of a code works too, for example one someone sent you." : {
       "localizations" : {
         "cs" : {
@@ -4495,6 +4511,22 @@
         }
       }
     },
+    "Bluetooth radios" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bluetooth rádia"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Radia Bluetooth"
+          }
+        }
+      }
+    },
     "Bluetooth: %@" : {
       "localizations" : {
         "cs" : {
@@ -6029,6 +6061,22 @@
         }
       }
     },
+    "Direct messages only" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jen v soukromých zprávách"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tylko w wiadomościach prywatnych"
+          }
+        }
+      }
+    },
     "Direct only" : {
       "localizations" : {
         "cs" : {
@@ -6615,6 +6663,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Wszystko tutaj jest zmyślone. Po wyjściu z demo wrócisz do łączenia z własnym radiem."
+          }
+        }
+      }
+    },
+    "Everywhere" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Všude"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wszędzie"
           }
         }
       }
@@ -8965,6 +9029,22 @@
         }
       }
     },
+    "Link previews" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Náhledy odkazů"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Podglądy linków"
+          }
+        }
+      }
+    },
     "Links" : {
       "localizations" : {
         "cs" : {
@@ -9297,22 +9377,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Długość geograficzna"
-          }
-        }
-      }
-    },
-    "Looking for Bluetooth radios…" : {
-      "localizations" : {
-        "cs" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Hledání Bluetooth rádií…"
-          }
-        },
-        "pl" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Szukanie radiów Bluetooth…"
           }
         }
       }
@@ -12461,6 +12525,22 @@
         }
       }
     },
+    "Opens the link" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Otevře odkaz"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Otwiera link"
+          }
+        }
+      }
+    },
     "Opens the repeater" : {
       "localizations" : {
         "cs" : {
@@ -12537,22 +12617,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Inne węzły mogą poprosić twoje radio o te dane. „Kontakty, którym pozwalam” to kontakty, którym dano pozwolenie."
-          }
-        }
-      }
-    },
-    "Other radios" : {
-      "localizations" : {
-        "cs" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Další rádia"
-          }
-        },
-        "pl" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Inne radia"
           }
         }
       }
@@ -16555,6 +16619,22 @@
         }
       }
     },
+    "Swipe a radio you've used to forget it." : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Přejetím po rádiu, které jste už použili, ho zapomenete."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Przesuń używane wcześniej radio, aby je zapomnieć."
+          }
+        }
+      }
+    },
     "Swipe to go back to the default." : {
       "localizations" : {
         "cs" : {
@@ -16651,18 +16731,18 @@
         }
       }
     },
-    "Tap one to switch to it; swipe a recent one to forget it. Bluetooth radios show while in range (not one connected to another phone); the first time, iOS asks for the radio's PIN, shown on its screen or 123456." : {
+    "Tap to load preview" : {
       "localizations" : {
         "cs" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Klepnutím na rádio na něj přepnete; přejetím po nedávném ho zapomenete. Bluetooth rádia se zobrazují, když jsou v dosahu (ne však rádio připojené k jinému telefonu); napoprvé se iOS zeptá na PIN rádia, který je na jeho displeji, nebo 123456."
+            "value" : "Klepnutím načtete náhled"
           }
         },
         "pl" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Stuknij radio, aby się na nie przełączyć; przesuń ostatnio używane, aby je zapomnieć. Radia Bluetooth są widoczne, gdy są w zasięgu (ale nie te połączone z innym telefonem); za pierwszym razem iOS pyta o PIN radia: jest na jego ekranie albo to 123456."
+            "value" : "Stuknij, aby wczytać podgląd"
           }
         }
       }
@@ -18574,6 +18654,22 @@
         }
       }
     },
+    "When tapped" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Po klepnutí"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Po stuknięciu"
+          }
+        }
+      }
+    },
     "Who enters the mesh through it: the first repeater in their packets' paths." : {
       "localizations" : {
         "cs" : {
@@ -18634,6 +18730,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Radio Wi-Fi"
+          }
+        }
+      }
+    },
+    "WiFi radios" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wi-Fi rádia"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Radia Wi-Fi"
           }
         }
       }
@@ -19800,6 +19912,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "dostarczono przez flood"
+          }
+        }
+      }
+    },
+    "delivered in %@" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "doručeno za %@"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "dostarczono w %@"
           }
         }
       }

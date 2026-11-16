@@ -2,7 +2,8 @@
 
 A native iPhone and iPad app for MeshCore radios, over **Bluetooth** or **WiFi**, with its own history and
 no internet needed. It works with stock MeshCore companion firmware and with [MeshChat firmware](../firmware),
-and it doesn't need anything else in this repository. Design: [DESIGN.md](DESIGN.md).
+and it doesn't need anything else in this repository. Design: [DESIGN.md](DESIGN.md). Changes by version:
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Layout
 
@@ -99,6 +100,10 @@ Running on iPhone and in the Simulator, in TestFlight:
 - **chats**: channels, listened channels, rooms, direct messages; unread markers and a tab badge; mentions
   highlighted; long-press a message for details, copy, reply with a mention, message the sender privately,
   show on the map, send again (a channel message nobody repeated), delete
+- **links** in messages are tappable, with a preview card (picture, title, site) as in Messages. Previews
+  load by themselves only in direct messages unless you choose otherwise (Settings › Link previews):
+  fetching one contacts the link's website, and on the mesh anyone can post a link. The fetch is the
+  app's own: HTTPS only, public hosts only, no cookies, no scripts, kept in the caches folder
 - **sending** with the web app's delivery states: sent / repeated ×N / not heard; delivered (try N) / no receipt
 - **message details**: every copy heard with timing and signal, the route with repeater names and distances,
   the sender's clock, the packet field by field with its airtime

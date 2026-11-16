@@ -172,7 +172,7 @@ final class NodeAnnotation: MLNPointAnnotation {
 struct MapLibreView: UIViewRepresentable {
     let points: [MapContent.Point]
     let route: [Position]
-    /// a node's links to its neighbours, drawn thinner and paler than a route
+    /// a node's links to its neighbours, drawn bold (only they and the node are shown then)
     let links: [[Position]]
     let clustered: Bool
     let focus: MapFocus?
@@ -295,6 +295,7 @@ struct MapLibreView: UIViewRepresentable {
                 lastRoute = parent.route
             }
 
+            var linksFitted = false
             if parent.links != lastLinks {
                 v.removeAnnotations(linkLines)
                 linkLines = parent.links.compactMap { line in
@@ -305,6 +306,10 @@ struct MapLibreView: UIViewRepresentable {
                 // just turned on: the node and its neighbours on screen
                 if lastLinks.isEmpty, !parent.links.isEmpty {
                     fit(v, parent.links.flatMap { $0 }.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) })
+                    // and stays fitted: no easing to the node when it was selected at the same moment, or
+                    // when the card's height comes in
+                    easeTarget = nil
+                    linksFitted = true
                 }
                 lastLinks = parent.links
             }
@@ -312,7 +317,7 @@ struct MapLibreView: UIViewRepresentable {
             if let f = parent.focus, f.serial != lastFocus {
                 easeTarget = nil
                 center(v, on: f)
-            } else if parent.selection != lastSelection {
+            } else if parent.selection != lastSelection, !linksFitted {
                 // a marker tapped (or picked): ease to it, zooming in but never out
                 easeTarget = parent.selection.flatMap { annotations[$0] }.flatMap { $0.count == 0 ? $0.coordinate : nil }
                 if let c = easeTarget { v.setCenter(c, zoomLevel: max(v.zoomLevel, 11), animated: true) }
@@ -412,11 +417,11 @@ struct MapLibreView: UIViewRepresentable {
         }
 
         func mapView(_ mapView: MLNMapView, strokeColorForShapeAnnotation annotation: MLNShape) -> UIColor {
-            linkLines.contains { $0 === annotation } ? .tintColor.withAlphaComponent(0.5) : .tintColor
+            linkLines.contains { $0 === annotation } ? .tintColor.withAlphaComponent(0.85) : .tintColor
         }
 
         func mapView(_ mapView: MLNMapView, lineWidthForPolylineAnnotation annotation: MLNPolyline) -> CGFloat {
-            linkLines.contains { $0 === annotation } ? 1.5 : 3
+            linkLines.contains { $0 === annotation } ? 4 : 3
         }
 
         // MARK: markers

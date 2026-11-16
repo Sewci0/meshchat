@@ -140,6 +140,49 @@ struct EngineTests {
         #expect(m.fingerprint != nil)
     }
 
+    /// A packet logged while connecting, before the channels were loaded, couldn't be read then: the
+    /// message drained right after still finds it in the log.
+    @Test func channelMessageFindsAPacketLoggedBeforeTheChannelsWereKnown() async throws {
+        let (engine, radio) = try await setUp()
+        let text = "Ala: dzień dobry"
+        try engine.store.insert(Self.record(radio.groupTextPacket(key: Self.publicKey, timestamp: 1_794_000_000, text: text, path: [0x39, 0x4E]), snr: 4.5))
+        radio.queue.append(radio.channelMessageFrame(slot: 0, timestamp: 1_794_000_000, text: text, hops: 2))
+        radio.pushLater(Data([0x83]), ms: 50)   // messages waiting
+        try await eventually { try !engine.store.messages(in: .channel(0)).isEmpty }
+        let m = try #require(try engine.store.messages(in: .channel(0)).first)
+        #expect(m.fingerprint != nil)
+        #expect(m.path == "394e")
+        #expect(m.snr == 4.5)
+    }
+
+    /// Messages saved before this was fixed get their packet when the radio connects.
+    @Test func unlinkedChannelMessagesAreRelinked() async throws {
+        let store = try Store.inMemory()
+        let text = "Ala: dzień dobry"
+        let builder = FakeRadio(contacts: [], channels: [])
+        let at = Date.now.addingTimeInterval(-3600)
+        try store.insert(Self.record(builder.groupTextPacket(key: Self.publicKey, timestamp: 1_794_000_000, text: text, path: [0x39]), snr: 6, at: at))
+        _ = try store.insert(Message(date: at.addingTimeInterval(0.2), senderTimestamp: 1_794_000_000, conversation: .channel(0), direction: .incoming,
+                                     sender: "Ala", text: "dzień dobry", status: .received, hops: 1, hashSize: 1))
+        // another, from the queue, whose packet was never heard: left as it is
+        _ = try store.insert(Message(date: at.addingTimeInterval(1), senderTimestamp: 1_794_000_050, conversation: .channel(0), direction: .incoming,
+                                     sender: "Ola", text: "hej", status: .received, hops: 3, hashSize: 1))
+        let radio = FakeRadio(contacts: [], channels: [ChannelInfo(index: 0, name: "Public", secret: Self.publicKey)])
+        let engine = MeshEngine(store: store)
+        await engine.connect(radio)
+        try await eventually { try store.messages(in: .channel(0)).contains { $0.fingerprint != nil } }
+        let ms = try store.messages(in: .channel(0))
+        #expect(ms.first { $0.sender == "Ala" }?.path == "39")
+        #expect(ms.first { $0.sender == "Ola" }?.fingerprint == nil)
+    }
+
+    static func record(_ raw: Data, snr: Double, at: Date = .now) -> PacketRecord {
+        let p = MeshPacket(raw: raw)!
+        return PacketRecord(date: at, route: "\(p.route)", type: p.payloadType.name, hops: p.hops, path: p.path.map(\.hex).joined(), hashSize: p.hashSize,
+                            snr: snr, rssi: -90, fingerprint: Int64(p.fingerprint), raw: raw,
+                            channelHash: p.payloadType == .groupText ? p.payload.first.map(Int.init) : nil, network: nil)
+    }
+
     @Test func listenedChannelReadsCopiesOnce() async throws {
         let (engine, radio) = try await setUp()
         try await engine.listen(to: "#test")

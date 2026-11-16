@@ -47,16 +47,6 @@ struct MeshBehaviourView: View {
         .formStyle(.grouped)
         .navigationTitle("Mesh behaviour")
         .task(id: model.isConnected) { await load() }
-        .confirmationDialog("Use \((confirmHash ?? 0) + 1)-byte path hashes?", isPresented: .present($confirmHash), titleVisibility: .visible) {
-            Button("Change") { if let h = confirmHash { write(String(localized: "Path hash size changed.")) { try await model.engine.setPathHashMode(h) } } }
-        } message: {
-            Text("Older repeaters may not pass on 2- or 3-byte paths. If messages stop getting through, switch back to 1 byte.")
-        }
-        .confirmationDialog("Repeat other nodes' packets?", isPresented: $confirmRepeat, titleVisibility: .visible) {
-            Button("Turn on") { write(String(localized: "Repeating on.")) { try await model.engine.setRepeat(true) } }
-        } message: {
-            Text("Your radio will pass on other people's packets. This uses battery and airtime; only turn it on if you're filling a gap in coverage.")
-        }
         .alert(message ?? "", isPresented: .present($message)) { Button("OK") {} }
         .sheet(isPresented: $tidying) { TidyContactsView() }
     }
@@ -144,6 +134,11 @@ struct MeshBehaviourView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .disabled(!model.isConnected || busy)
+                .confirmationDialog("Use \((confirmHash ?? 0) + 1)-byte path hashes?", isPresented: .present($confirmHash), titleVisibility: .visible) {
+                    Button("Change") { if let h = confirmHash { write(String(localized: "Path hash size changed.")) { try await model.engine.setPathHashMode(h) } } }
+                } message: {
+                    Text("Older repeaters may not pass on 2- or 3-byte paths. If messages stop getting through, switch back to 1 byte.")
+                }
                 Text("Bigger hashes tell repeaters apart better but fit fewer hops in a packet. Everyone on your network should use the same.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -155,6 +150,11 @@ struct MeshBehaviourView: View {
                     if new { confirmRepeat = true } else { write(String(localized: "Repeating off.")) { try await model.engine.setRepeat(false) } }
                 }))
                 .disabled(!model.isConnected || busy || (!on && !allowed))
+                .confirmationDialog("Repeat other nodes' packets?", isPresented: $confirmRepeat, titleVisibility: .visible) {
+                    Button("Turn on") { write(String(localized: "Repeating on.")) { try await model.engine.setRepeat(true) } }
+                } message: {
+                    Text("Your radio will pass on other people's packets. This uses battery and airtime; only turn it on if you're filling a gap in coverage.")
+                }
                 if let r = repeatRanges, !allowed {
                     Text(r.isEmpty ? "This radio doesn't repeat on any frequency." : "This radio only repeats on \(r.map(Self.describe).joined(separator: ", ")).")
                         .font(.caption).foregroundStyle(.secondary)

@@ -208,4 +208,88 @@ struct AnalysisTests {
         #expect(q?.next?.key == b.key.hex)
         #expect(r.quiet(b.key.hex, now: now) == nil)   // still heard
     }
+
+    @Test func mapLinksEndAtTheLinkedRepeaters() {
+        let now = Date()
+        let dir = NodeDirectory(contacts: [a, b, c], heard: [], home: home)
+        // C passes on to B, B to A: B links both, A and C only B
+        let packets = (0..<4).map { packet("774e39", at: now - 600 + Double($0) * 60) }
+        let r = RepeaterAnalysis(packets: packets, channelRoutes: [], directory: dir, now: now)
+        let linked = MapLinks.linked(from: b.key.hex, analysis: r)
+        #expect(Set(linked) == [a.key.hex, c.key.hex])
+        let lines = MapLinks.lines(from: b.key.hex, analysis: r)
+        #expect(lines.count == linked.count)
+        #expect(lines.map { $0.last! } == linked.compactMap { r.directory.nodes[$0]?.position })   // each line ends at one of them
+        #expect(MapLinks.linked(from: a.key.hex, analysis: r) == [b.key.hex])
+    }
+
+    @Test func heardDirectlyTimesOutAfterAnHour() {
+        let now = Date()
+        func s(ago: Double?) -> RepeaterAnalysis.Summary {
+            RepeaterAnalysis.Summary(key: "k", name: "k", type: .repeater, isContact: false, position: nil, km: nil, relayed: 1, firstHop: 0,
+                                     lastHop: ago == nil ? 0 : 1, uncertainShare: 0, direct: ago != nil, snrMedian: nil, people: 0, nodes: 0,
+                                     links: 0, lastSeen: now, lastDirect: ago.map { now - $0 }, activity: [])
+        }
+        #expect(s(ago: 60).heardDirectly(now: now))
+        #expect(s(ago: 59 * 60).heardDirectly(now: now))
+        #expect(!s(ago: 61 * 60).heardDirectly(now: now))   // heard directly once, not lately: further along now
+        #expect(!s(ago: nil).heardDirectly(now: now))
+    }
+
+    @Test func yoursFollowsYourLatestMessages() {
+        let now = Date()
+        let dir = NodeDirectory(contacts: [a, b, c], heard: [], home: home)
+        // three of yours through A two days ago, one through C yesterday, then two through B today
+        let mine: [(String, Double)] = [("39", 2 * 86400 + 300), ("39", 2 * 86400 + 200), ("39", 2 * 86400 + 100), ("77", 86400), ("4e", 600), ("4e", 60)]
+        let routes = mine.map { (sender: String?.none, path: $0.0, hashSize: 1, date: now - $0.1) }
+        let r = RepeaterAnalysis(packets: [], channelRoutes: routes, directory: dir, now: now)
+        #expect(r.yours?.key == b.key.hex)   // the last 5: B, B, C, A, A: B and A tie, B is the latest
+        #expect(r.yours?.passed == 2)
+        // across the period alone A would have won (3 against 2)
+        #expect(r.stats[a.key.hex]?.heardYou == 3)
+    }
+
+    @Test func heardDirectlyFreshestThenStrongest() {
+        let now = Date()
+        func s(_ name: String, ago: Double?, snr: Double) -> RepeaterAnalysis.Summary {
+            var x = RepeaterAnalysis.Summary(key: name, name: name, type: .repeater, isContact: false, position: nil, km: nil,
+                                             relayed: 1, firstHop: 0, lastHop: ago == nil ? 0 : 1, uncertainShare: 0, direct: ago != nil,
+                                             snrMedian: snr, people: 0, nodes: 0, links: 0, lastSeen: now,
+                                             lastDirect: ago.map { now - $0 }, activity: [])
+            x.recentSnr = snr
+            return x
+        }
+        let list = [s("old strong", ago: 2 * 86400, snr: 9), s("live weak", ago: 60, snr: -3), s("recent", ago: 600, snr: 5),
+                    s("live strong", ago: 120, snr: 7), s("old weak", ago: 86400, snr: -6), s("via mesh", ago: nil, snr: 12)]
+        let ordered = list.sorted { RepeaterAnalysis.Summary.freshestStrongest($0, $1, now: now) }.map(\.name)
+        #expect(ordered == ["live strong", "live weak", "recent", "old strong", "old weak", "via mesh"])
+    }
+
+    @Test func recentSignalIsTheMedianOfTheLastPacketsHeardDirectly() {
+        let now = Date()
+        let dir = NodeDirectory(contacts: [a, b], heard: [], home: home)
+        // twelve packets straight from A, 0 to 11 dB, oldest first, and one through A to B (B heard directly)
+        var packets = (0..<12).map { packet("39", at: now - 3600 + Double($0) * 60, snr: Double($0)) }
+        packets.append(packet("394e", at: now - 30, snr: 9))
+        let r = RepeaterAnalysis(packets: packets, channelRoutes: [], directory: dir, now: now)
+        #expect(r.summary(a.key.hex).recentSnr == 7)   // the last ten (2…11): their median, not the period's
+        #expect(r.summary(b.key.hex).recentSnr == 9)
+        #expect(r.summary("ff").recentSnr == nil)
+    }
+
+    @Test func oldEvidenceIsNotQuietNow() {
+        // A heard directly, then traffic through B two days ago, then nothing logged (MeshChat wasn't
+        // connected) until a few packets just now: that says nothing about A today
+        let now = Date()
+        let dir = NodeDirectory(contacts: [a, b], heard: [], home: home)
+        var packets = (0..<20).map { packet("39", at: now - 2 * 86400 - 7200 + Double($0) * 60, snr: 8) }
+        packets += (0..<100).map { packet("4e", at: now - 2 * 86400 + Double($0) * 30, snr: 4) }
+        packets += (0..<2).map { packet("4e", at: now - 60 + Double($0) * 20, snr: 4) }
+        #expect(RepeaterAnalysis(packets: packets, channelRoutes: [], directory: dir, now: now).quiet(a.key.hex, now: now) == nil)
+        // once enough traffic arrives again without A, it's quiet, with the date it was last heard
+        packets += (0..<30).map { packet("4e", at: now - 3000 + Double($0) * 90, snr: 4) }
+        let q = RepeaterAnalysis(packets: packets, channelRoutes: [], directory: dir, now: now).quiet(a.key.hex, now: now)
+        #expect(q != nil && q?.missed == 32)
+        #expect(q.map { now.timeIntervalSince1970 - $0.since.timeIntervalSince1970 > 86400 } == true)
+    }
 }

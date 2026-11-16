@@ -183,7 +183,8 @@ struct AdminSections: View {
         } header: {
             Text("Command line")
         }
-        .confirmationDialog(pending?.title ?? "", isPresented: .present($pending), titleVisibility: .visible, presenting: pending) { p in
+        .alert(pending?.title ?? "", isPresented: .present($pending), presenting: pending) { p in
+            Button("Cancel", role: .cancel) {}
             Button("Send", role: .destructive) { run(p.command) }
         } message: { p in Text(p.message) }
     }

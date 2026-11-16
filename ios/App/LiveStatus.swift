@@ -11,7 +11,7 @@ import UIKit
 /// the app keeps itself running).
 ///
 /// What it shows: the link and since when, the battery, unread conversations and the newest message
-/// (or how your last one went), and the mesh at a glance: packets per 5 minutes over the hour, the
+/// (or how your last one went, or else who's about and the radio's own numbers: people heard, airtime, uptime), and the mesh at a glance: packets per 5 minutes over the hour, the
 /// signal lately, repeaters heard directly, and your repeater.
 @MainActor
 final class LiveStatus {
@@ -29,6 +29,7 @@ final class LiveStatus {
     private var pulse: MeshPulse?
     private var pulseAt = Date.distantPast
     private var directRepeaters: Int?
+    private var people: Int?
     private var lastPackets = -1
     /// your repeater: from a day of the log, every 10 minutes
     private var repeater: (name: String, heard: Date?, quiet: Bool)?
@@ -36,6 +37,8 @@ final class LiveStatus {
     /// the radio's battery: asked every 10 minutes while connected
     private var batteryMv: Int?
     private var batteryAt = Date.distantPast
+    /// the radio's own numbers, asked with the battery (firmware that can tell)
+    private var stats: (tx: Double, rx: Double, upSince: Date)?
 
     typealias State = RadioActivityAttributes.ContentState
 
@@ -116,6 +119,19 @@ final class LiveStatus {
             lastPackets = model.packetVersion
             pulseAt = now
             let dir = model.directory
+            // people heard in the hour: who wrote (not anyone blocked), and whose advert arrived
+            let hourAgo = now.addingTimeInterval(-PeopleHeard.window)
+            let blocked = model.blockList, me = model.me?.name, myKey = model.me?.key.hex
+            let adverts = model.heard.filter {
+                $0.type == Int(NodeType.companion.rawValue) && $0.lastHeard.timeIntervalSince1970 >= hourAgo.timeIntervalSince1970
+                    && $0.key != myKey && !blocked.isBlocked(name: $0.name, key: $0.key)
+            }.map(\.name)
+            people = await Task.detached(priority: .utility) {
+                let writers = ((try? store.incoming(since: hourAgo)) ?? [])
+                    .filter { !blocked.hides($0) && PeopleHeard.writtenLately(senderTimestamp: $0.senderTimestamp, now: now) }
+                    .compactMap(\.sender)
+                return PeopleHeard.count(writers: writers, advertisers: adverts, me: me)
+            }.value
             (pulse, directRepeaters) = await Task.detached(priority: .utility) { () -> (MeshPulse, Int) in
                 let packets = (try? store.recentPackets(since: now.addingTimeInterval(-3600))) ?? []
                 let pulse = MeshPulse(packets: packets.map { ($0.date, $0.hops, $0.path, $0.hashSize, $0.snr) }, now: now)
@@ -144,6 +160,13 @@ final class LiveStatus {
             batteryAt = now
             if let b = try? await model.engine.battery() {
                 batteryMv = b.millivolts > 0 ? Int((Double(b.millivolts) / 50).rounded()) * 50 : nil
+            }
+            // rounded, and the start kept to the minute: the status isn't redrawn for a second's difference
+            if (model.device?.firmwareCode ?? 0) >= 8, let s = try? await model.engine.radioStats(), s.uptimeSeconds > 0 {
+                let up = Double(s.uptimeSeconds)
+                let started = (now.timeIntervalSince1970 - up) / 60
+                stats = ((Double(s.txAirSeconds) / up * 1000).rounded() / 1000, (Double(s.rxAirSeconds) / up * 1000).rounded() / 1000,
+                         Date(timeIntervalSince1970: started.rounded() * 60))
             }
         }
     }
@@ -177,8 +200,10 @@ final class LiveStatus {
 
     private func state(_ model: AppModel, wifi: Bool) -> State {
         #if DEBUG
-        // screenshots of the connected status without a radio: launch with -demoLiveActivity (debug builds only)
-        if ProcessInfo.processInfo.arguments.contains("-demoLiveActivity") { return Self.demo }
+        // screenshots of the connected status without a radio: launch with -demoLiveActivity (debug builds
+        // only), then "sent" for how your last message went or "idle" for the radio's numbers
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-demoLiveActivity") { return Self.demo(args.indices.contains(i + 1) ? args[i + 1] : "") }
         #endif
         let link: State.Link = switch model.connection {
         // over WiFi in the background the link pauses, unless the app keeps itself running
@@ -206,7 +231,7 @@ final class LiveStatus {
         }
 
         // your last message, for 10 minutes
-        let sent = (try? model.store.outgoing(since: .now.addingTimeInterval(-600)))?.max { $0.date < $1.date }.map { m -> State.Sent in
+        let sent = (try? model.store.outgoing(since: .now.addingTimeInterval(-600)))?.max { $0.date.timeIntervalSince1970 < $1.date.timeIntervalSince1970 }.map { m -> State.Sent in
             let (status, ok): (String, Bool?) = switch m.status {
             case .repeated: (String(localized: "heard by repeaters"), true)
             case .delivered: (String(localized: "delivered"), true)
@@ -216,7 +241,19 @@ final class LiveStatus {
             case .sending: (String(localized: "sending"), nil)
             default: (String(localized: "sent"), nil)
             }
-            return State.Sent(status: status, at: m.date, ok: ok)
+            // in full, worded as under the message in the chat
+            let detail: String = switch m.status {
+            case .repeated: String(localized: "repeated ×\(m.repeats)")
+            case .delivered:
+                if let t = m.ackTry, t > 1 { String(localized: "delivered · try \(t)") }
+                else if let ms = m.roundTripMs, ms > 0 { String(localized: "delivered in \(Duration.milliseconds(ms).formatted(.units(allowed: [.seconds], width: .narrow, fractionalPart: .show(length: 1))))") }
+                else { String(localized: "delivered") }
+            case .notHeard: String(localized: "not heard · \(m.attempts) tries")
+            case .sent where m.attempts > 1: String(localized: "sent · try \(m.attempts)")
+            default: status
+            }
+            return State.Sent(status: status, at: m.date, ok: ok, to: Self.cut(model.title(of: m.conversation), 24), detail: detail,
+                              text: showText ? Self.cut(m.text.replacingOccurrences(of: "\n", with: " "), 80) : nil)
         }
 
         let sf = model.me?.radio.spreadingFactor ?? 8
@@ -225,19 +262,24 @@ final class LiveStatus {
                      snr: pulse?.snr, level: pulse?.snr.map { MeshPulse.level(snr: $0, spreadingFactor: sf) },
                      repeaters: directRepeaters,
                      rptName: repeater.map { Self.cut($0.name, 24) }, rptHeard: repeater?.heard, rptQuiet: repeater?.quiet,
-                     batteryMv: batteryMv, sent: sent)
+                     batteryMv: batteryMv, sent: sent,
+                     people: people, txShare: stats?.tx, rxShare: stats?.rx, upSince: stats?.upSince)
     }
 
     #if DEBUG
-    static var demo: State {
+    static func demo(_ show: String) -> State {
         let now = Date.now
-        return State(link: .connected, since: now.addingTimeInterval(-2 * 3600 - 300), unread: 3,
-                     msg: State.Msg(from: "Ania", place: "Public",
+        let quiet = show == "sent" || show == "idle"
+        let sent = show != "sent" ? nil : State.Sent(status: String(localized: "heard by repeaters"), at: now.addingTimeInterval(-90), ok: true, to: "Public",
+                                                     detail: String(localized: "repeated ×\(3)"), text: "Test from Oliwa, who hears me?")
+        return State(link: .connected, since: now.addingTimeInterval(-2 * 3600 - 300), unread: quiet ? 0 : 3,
+                     msg: quiet ? nil : State.Msg(from: "Ania", place: "Public",
                                     text: String(localized: "Anyone hearing the new repeater on the hill? I get it at +6 dB from the east side.", comment: "Demo chat message"),
                                     at: now.addingTimeInterval(-240), kind: .channel, mention: true),
                      heardAt: now.addingTimeInterval(-50), rate: [3, 5, 2, 8, 12, 6, 2, 1, 4, 9, 5, 3], rateEnd: now.addingTimeInterval(120),
                      perHour: 60, snr: 7, level: 3, repeaters: 4, rptName: "Olsztyn Jura RPT", rptHeard: now.addingTimeInterval(-180),
-                     rptQuiet: false, batteryMv: 3950, sent: nil)
+                     rptQuiet: false, batteryMv: 3950, sent: sent,
+                     people: 5, txShare: 0.004, rxShare: 0.06, upSince: now.addingTimeInterval(-2 * 86400 - 4 * 3600))
     }
     #endif
 

@@ -35,8 +35,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: MeshChat
-        CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "1.1"
+        CFBundleVersion: "3"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
         UIApplicationSceneManifest:
@@ -85,8 +85,8 @@ targets:
       path: Widgets/Info.plist
       properties:
         CFBundleDisplayName: MeshChat
-        CFBundleShortVersionString: "1.0"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "1.1"
+        CFBundleVersion: "3"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:

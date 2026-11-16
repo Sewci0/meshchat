@@ -108,7 +108,7 @@ struct NotificationSettingsView: View {
     private func summary(_ c: ConversationID) -> String {
         let s = model.notificationSettings, kind = model.kind(of: c)
         if let until = s.mutedUntil(c) {
-            return until == .distantFuture ? String(localized: "Muted") : String(localized: "Muted until \(until.formatted(date: .omitted, time: .shortened))")
+            return until == .distantFuture ? String(localized: "Muted") : String(localized: "Muted until \(until.timeOrDay())")
         }
         return s.level(for: c, kind: kind).label
     }
@@ -141,7 +141,7 @@ struct NotifyMenu: View {
             Divider()
             if let muted {
                 Button { model.notificationSettings.mute(conversation, until: nil) } label: {
-                    Label(muted == .distantFuture ? "Unmute" : "Unmute (muted until \(muted.formatted(date: .omitted, time: .shortened)))",
+                    Label(muted == .distantFuture ? "Unmute" : "Unmute (muted until \(muted.timeOrDay()))",
                           systemImage: "bell")
                 }
             } else {

@@ -176,6 +176,70 @@
         }
       }
     },
+    "%lld people" : {
+      "localizations" : {
+        "cs" : {
+          "variations" : {
+            "plural" : {
+              "few" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld lidé"
+                }
+              },
+              "many" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld lidí"
+                }
+              },
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld člověk"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld lidí"
+                }
+              }
+            }
+          }
+        },
+        "pl" : {
+          "variations" : {
+            "plural" : {
+              "few" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld osoby"
+                }
+              },
+              "many" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld osób"
+                }
+              },
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld osoba"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld osoby"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "%lld pkts/h" : {
       "localizations" : {
         "cs" : {
@@ -444,6 +508,22 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "1 person" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "1 člověk"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "1 osoba"
           }
         }
       }
@@ -726,18 +806,50 @@
         }
       }
     },
-    "Your last message: %@" : {
+    "To %@" : {
       "localizations" : {
         "cs" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Vaše poslední zpráva: %@"
+            "value" : "Komu: %@"
           }
         },
         "pl" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Twoja ostatnia wiadomość: %@"
+            "value" : "Do: %@"
+          }
+        }
+      }
+    },
+    "Your last message" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vaše poslední zpráva"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Twoja ostatnia wiadomość"
+          }
+        }
+      }
+    },
+    "airtime" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "vysílací čas"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "czas w eterze"
           }
         }
       }
@@ -790,6 +902,22 @@
         }
       }
     },
+    "heard, 1 h" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "slyšet, 1 h"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "słychać, 1 h"
+          }
+        }
+      }
+    },
     "in %@" : {
       "localizations" : {
         "cs" : {
@@ -834,6 +962,38 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "brak sygnału"
+          }
+        }
+      }
+    },
+    "nobody" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "nikoho"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "nikogo"
+          }
+        }
+      }
+    },
+    "uptime" : {
+      "localizations" : {
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "doba běhu"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "czas pracy"
           }
         }
       }

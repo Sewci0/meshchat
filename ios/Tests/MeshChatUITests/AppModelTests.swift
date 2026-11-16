@@ -32,6 +32,33 @@ struct AppModelTests {
         Issue.record("timed out")
     }
 
+    @Test func theRadioAsLastSyncedIsShownBeforeItAnswers() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("meshchat-cache-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let d = UserDefaults(suiteName: "meshchat-tests-\(UUID().uuidString)")!
+        let radio = FakeRadio(contacts: [alice, room], channels: [ChannelInfo(index: 0, name: "Public", secret: Self.publicKey)])
+        let first = AppModel(engine: MeshEngine(store: try .inMemory()), defaults: d)
+        first.radioCacheDirectory = dir
+        first.radioCacheDelay = .zero
+        first.makeTransport = { _ in radio }
+        #expect(!first.radioKnown)
+        await first.connect(.wifi(host: "meshcore.local", port: 5000))
+        try await eventually { first.radioKnown && first.contacts.count == 2 }
+        try await Task.sleep(for: .milliseconds(200))   // the cache is written in the background
+        // the next launch, before connecting: the channels and contacts are there, rooms are rooms
+        let next = AppModel(engine: MeshEngine(store: try .inMemory()), defaults: d)
+        next.radioCacheDirectory = dir
+        #expect(!next.radioKnown && next.contacts.isEmpty)
+        next.restoreRadioCache()
+        #expect(next.radioKnown)
+        #expect(next.channels.map(\.name) == ["Public"])
+        #expect(next.contacts[room.key]?.type == .room && next.contacts[alice.key]?.name == "Alice")
+        // another radio: none of this one's
+        next.makeTransport = { _ in FakeRadio(contacts: [], channels: []) }
+        await next.connect(.wifi(host: "other.local", port: 5000))
+        #expect(next.contacts[alice.key] == nil)
+    }
+
     @Test func followsTheRadiosNetwork() async throws {
         let (model, radio, d) = try await make()
         let south = "869.618/62.5/6", national = "869.618/62.5/8"
@@ -97,6 +124,23 @@ struct AppModelTests {
         try await model.engine.leaveRoom(room.key)
         try await eventually { model.roomList.isEmpty }
         #expect(model.unreadCount == 0)   // a room you left doesn't count
+    }
+
+    @Test func aRoomRemovedFromTheRadioLeavesTheChatList() async throws {
+        let (model, radio, _) = try await make()
+        radio.queue.append(radio.directMessageFrame(from: room.key, timestamp: 1_794_000_100, text: "witajcie", author: Data([1, 2, 3, 4])))
+        radio.push(Data([0x83]))
+        try await eventually { model.roomList == [.direct(room.key)] }
+
+        // removed from the radio's contacts (Tidy contacts › Remove all, Nodes, the map): left, not kept as a
+        // nameless room or turned into a direct message
+        try await model.engine.removeContacts([room.key])
+        try await eventually { model.contacts[room.key] == nil && model.rooms[room.key.hex]?.left == true }
+        #expect(model.roomList.isEmpty)
+        #expect(model.directList.isEmpty)
+        #expect(model.isRoom(.direct(room.key)))
+        #expect(model.unreadCount == 0)
+        #expect(try model.store.messages(in: .direct(room.key)).count == 1)   // its posts stay
     }
 
     @Test func swipingDeletesConversations() async throws {

@@ -170,20 +170,20 @@ struct TidyContactsView: View {
         Section {
             Button(role: .destructive) { confirmAll = true } label: { Text("Remove all \(total) contacts…") }
                 .disabled(total == 0 || !model.isConnected || run.active)
+                .confirmationDialog("Remove contacts from the radio?", isPresented: $confirmAll, titleVisibility: .visible) {
+                    if favourites > 0 {
+                        Button(favourites == 1 ? "Remove all but 1 favourite" : "Remove all but \(favourites) favourites", role: .destructive) {
+                            start(model.allContacts(keepFavourites: true).map(\.key))
+                        }
+                    }
+                    Button("Remove all \(total)", role: .destructive) { start(model.allContacts(keepFavourites: false).map(\.key)) }
+                } message: {
+                    Text("The radio forgets them, their routes and its logins to rooms and repeaters. Messages stay on this iPhone.")
+                }
         } header: {
             Text("Clear the list")
         } footer: {
             Text("Every contact, people and rooms too. You can't message someone again until their next advert adds them back, and rooms need joining again. The app keeps what it heard: they stay in Nodes and on the map.")
-        }
-        .confirmationDialog("Remove contacts from the radio?", isPresented: $confirmAll, titleVisibility: .visible) {
-            if favourites > 0 {
-                Button(favourites == 1 ? "Remove all but 1 favourite" : "Remove all but \(favourites) favourites", role: .destructive) {
-                    start(model.allContacts(keepFavourites: true).map(\.key))
-                }
-            }
-            Button("Remove all \(total)", role: .destructive) { start(model.allContacts(keepFavourites: false).map(\.key)) }
-        } message: {
-            Text("The radio forgets them, their routes and its logins to rooms and repeaters. Messages stay on this iPhone.")
         }
     }
 

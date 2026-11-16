@@ -165,11 +165,12 @@ struct RadioPicker: View {
     }
 }
 
-/// Settings › Connection: the radio in use and its state in one row, then every other radio in one list
-/// (recent ones, and Bluetooth radios in range, each once), WiFi addresses behind a row of their own, and
-/// forgetting. Tapping another radio scrolls up to the first row, where its connecting shows; switching
-/// away from a working link asks first. (Staying connected in the background over WiFi is in
-/// Notifications, with the lock-screen status it serves.)
+/// Settings › Connection: the radio in use, its state and what you can do with it (including its Bluetooth
+/// PIN, on a page of its own); then the other radios by how they're reached: Bluetooth (ones used before,
+/// and ones in range, each once) and WiFi (addresses used before, and adding one). Tapping another radio
+/// scrolls up to the first row, where its connecting shows; switching away from a working link asks first.
+/// (Staying connected in the background over WiFi is in Notifications, with the lock-screen status it
+/// serves.)
 struct ConnectionSettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var confirmForget = false
@@ -182,7 +183,9 @@ struct ConnectionSettingsView: View {
         let current = model.savedRadio
         let recent = model.recentRadios.filter { $0.key != current?.key }
         let recentKeys = Set(recent.map(\.key))
-        // in range, not the one in use and not already listed as recent
+        let recentBluetooth = recent.filter(\.isBluetooth)
+        let recentWiFi = recent.filter { if case .wifi = $0 { true } else { false } }
+        // in range, not the one in use and not already listed as used before
         let nearby = scan.radios.values
             .map { (radio: SavedRadio.bluetooth(id: $0.id, name: $0.name), rssi: $0.rssi) }
             .filter { $0.radio.key != current?.key && !recentKeys.contains($0.radio.key) }
@@ -199,30 +202,48 @@ struct ConnectionSettingsView: View {
                         Button("Reconnect") { Task { await model.reconnect(force: true) } }
                     }
                     if current != nil { Toggle("Reconnect automatically", isOn: $model.autoReconnect) }
+                    // set on the radio, so only while connected; a WiFi radio only if it has Bluetooth too
+                    if current?.isBluetooth == true || (model.isConnected && (model.device?.blePin ?? 0) != 0) {
+                        NavigationLink("Bluetooth PIN") { BluetoothPinView() }
+                            .disabled(!model.isConnected)
+                    }
                 } header: {
                     Text("This radio").id(Self.top)
                 } footer: {
-                    Text((model.disconnectedByYou
-                          ? String(localized: "You disconnected: MeshChat stays off the radio until you reconnect.")
-                          : String(localized: "Reconnects by itself when the link drops: the radio restarted, went out of range, or WiFi changed."))
-                         + (current?.isBluetooth == false ? " " + String(localized: "To keep receiving in the background over WiFi, see Notifications.") : ""))
+                    if current != nil {
+                        Text((model.disconnectedByYou
+                              ? String(localized: "You disconnected: MeshChat stays off the radio until you reconnect.")
+                              : String(localized: "Reconnects by itself when the link drops: the radio restarted, went out of range, or WiFi changed."))
+                             + (current?.isBluetooth == false ? " " + String(localized: "To keep receiving in the background over WiFi, see Notifications.") : ""))
+                    }
                 }
 
                 Section {
-                    ForEach(recent, id: \.key) { r in
+                    ForEach(recentBluetooth, id: \.key) { r in
                         otherRow(r, rssi: rssi(of: r), proxy: proxy)
                             .swipeActions { Button("Forget", role: .destructive) { model.forget(r) } }
                     }
                     ForEach(nearby, id: \.radio.key) { n in otherRow(n.radio, rssi: n.rssi, proxy: proxy) }
                     bluetoothState(empty: nearby.isEmpty)
-                    NavigationLink { WiFiRadioView() } label: { Label("Add a WiFi radio…", systemImage: "wifi") }
                 } header: {
-                    Text("Other radios")
+                    Text("Bluetooth radios")
                 } footer: {
-                    Text("Tap one to switch to it; swipe a recent one to forget it. Bluetooth radios show while in range (not one connected to another phone); the first time, iOS asks for the radio's PIN, shown on its screen or 123456.")
+                    if scan.availability == .on || scan.availability == .starting {
+                        Text("Radios with Bluetooth companion firmware. The first time, iOS asks for the radio's PIN (shown on its screen, or 123456). A radio connected to another phone doesn't show up here.")
+                    }
                 }
 
-                if current != nil { BluetoothPinSection() }
+                Section {
+                    ForEach(recentWiFi, id: \.key) { r in
+                        otherRow(r, rssi: nil, proxy: proxy)
+                            .swipeActions { Button("Forget", role: .destructive) { model.forget(r) } }
+                    }
+                    NavigationLink { WiFiRadioView() } label: { Label("Add a WiFi radio…", systemImage: "plus") }
+                } header: {
+                    Text("WiFi radios")
+                } footer: {
+                    if !recent.isEmpty { Text("Swipe a radio you've used to forget it.") }
+                }
 
                 if current != nil {
                     Section {
@@ -241,7 +262,8 @@ struct ConnectionSettingsView: View {
             .formStyle(.grouped)
             .navigationTitle("Connection")
             .task { await scan.run() }
-            .confirmationDialog("Switch to \(switching?.title ?? String(localized: "this radio"))?", isPresented: .present($switching), titleVisibility: .visible) {
+            .alert("Switch to \(switching?.title ?? String(localized: "this radio"))?", isPresented: .present($switching)) {
+                Button("Cancel", role: .cancel) {}
                 Button("Switch") { if let r = switching { go(r, proxy) } }
             } message: {
                 if let title = current?.title { Text("MeshChat disconnects from \(title) and connects to this one.") }
@@ -252,7 +274,8 @@ struct ConnectionSettingsView: View {
 
     private static let top = "current radio"
 
-    /// A recent or nearby radio: its name, how it's reached, and its signal while in range.
+    /// A radio used before or in range: its name (a WiFi radio's is its address, with the port when it isn't
+    /// the usual one), and its signal while in range. The section says how it's reached.
     private func otherRow(_ r: SavedRadio, rssi: Int?, proxy: ScrollViewProxy) -> some View {
         Button { choose(r, proxy) } label: {
             LabeledContent {
@@ -263,7 +286,7 @@ struct ConnectionSettingsView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         // (plain colours: a button's tint would make the name look like a link)
                         Text(r.title).foregroundStyle(Color.primary)
-                        Text(r.linkName).font(.caption).foregroundStyle(Color.secondary)
+                        if case .wifi(_, let port) = r, port != 5000 { Text(r.linkName).font(.caption).foregroundStyle(Color.secondary) }
                     }
                 } icon: { Image(systemName: r.isBluetooth ? "antenna.radiowaves.left.and.right" : "wifi") }
             }
@@ -286,7 +309,7 @@ struct ConnectionSettingsView: View {
             }
             #endif
         case .starting, .on:
-            if empty { HStack { ProgressView(); Text("Looking for Bluetooth radios…").foregroundStyle(.secondary) } }
+            if empty { HStack { ProgressView(); Text("Looking for radios…").foregroundStyle(.secondary) } }
         }
     }
 
@@ -337,6 +360,18 @@ struct CurrentRadioRow: View {
         } else {
             Label("No radio yet: pick one below", systemImage: "antenna.radiowaves.left.and.right.slash").foregroundStyle(.secondary)
         }
+    }
+}
+
+/// The radio's Bluetooth pairing PIN, from Settings › Connection.
+struct BluetoothPinView: View {
+    var body: some View {
+        Form { BluetoothPinSection() }
+            .formStyle(.grouped)
+            .navigationTitle("Bluetooth PIN")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
     }
 }
 

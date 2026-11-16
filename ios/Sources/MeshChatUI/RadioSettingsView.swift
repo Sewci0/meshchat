@@ -34,6 +34,14 @@ struct NetworkSettingsView: View {
                         ShareLink(item: p.shareLink) { Label("Share", systemImage: "square.and.arrow.up") }.tint(.green)
                     }
                     .contextMenu { menu(for: p, active: active?.id == p.id) }
+                    // on the row, so the dialog points at the network it's about (since iOS 26 it's a
+                    // popover anchored to the view it's attached to)
+                    .confirmationDialog(String(localized: "Switch to \(p.name)?"), isPresented: Binding(get: { applying?.id == p.id }, set: { if !$0 { applying = nil } }), titleVisibility: .visible) {
+                        Button("Switch") { switchTo(p) }
+                    } message: { Text(switchWarning(to: p)) }
+                    .confirmationDialog(String(localized: "Delete \(p.name)?"), isPresented: Binding(get: { deleting?.id == p.id }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible) {
+                        Button("Delete", role: .destructive) { model.radioProfiles.remove(id: p.id) }
+                    } message: { Text("Only the saved network goes; the radio stays as it is.") }
                 }
                 if model.radioProfiles.profiles.isEmpty {
                     Text("No saved networks. Save the radio's current settings, or add one below.").foregroundStyle(.secondary)
@@ -112,14 +120,6 @@ struct NetworkSettingsView: View {
         .onChange(of: model.me?.txPower) { seedPower() }
         .sheet(item: $editing) { d in ProfileEditorView(draft: d) }
         .sheet(isPresented: $addingLink) { AddNetworkFromCodeView() }
-        .confirmationDialog(applying.map { String(localized: "Switch to \($0.name)?") } ?? "", isPresented: .present($applying), titleVisibility: .visible) {
-            Button("Switch") { if let p = applying { switchTo(p) } }
-        } message: {
-            if let p = applying { Text(switchWarning(to: p)) }
-        }
-        .confirmationDialog(deleting.map { String(localized: "Delete \($0.name)?") } ?? "", isPresented: .present($deleting), titleVisibility: .visible) {
-            Button("Delete", role: .destructive) { if let p = deleting { model.radioProfiles.remove(id: p.id) } }
-        } message: { Text("Only the saved network goes; the radio stays as it is.") }
         .alert(message ?? "", isPresented: .present($message)) { Button("OK") {} }
     }
 
@@ -376,11 +376,17 @@ struct RadioDeviceView: View {
             Section {
                 Button("Restart radio…") { confirmRestart = true }
                     .disabled(!model.isConnected || busy)
+                    .confirmationDialog("Restart the radio?", isPresented: $confirmRestart, titleVisibility: .visible) {
+                        Button("Restart") { run(String(localized: "Radio restarting. MeshChat reconnects when it's back, in about 15 seconds.")) { try await model.engine.reboot() } }
+                    } message: { Text("It's offline for about 15 seconds. Settings and messages waiting on it are kept.") }
             }
 
             Section {
                 Button("Erase radio…", role: .destructive) { confirmErase = true }
                     .disabled(!model.isConnected || busy)
+                    .confirmationDialog("Erase the radio?", isPresented: $confirmErase, titleVisibility: .visible) {
+                        Button("Erase…", role: .destructive) { typedName = ""; typingName = true }
+                    } message: { Text(eraseWarning) }
             } footer: {
                 Text("Chat history on this iPhone stays.")
             }
@@ -390,14 +396,6 @@ struct RadioDeviceView: View {
         .task(id: model.isConnected) {
             await model.refreshBattery()
             clock = model.isConnected ? try? await model.engine.radioTime() : nil
-        }
-        .confirmationDialog("Restart the radio?", isPresented: $confirmRestart, titleVisibility: .visible) {
-            Button("Restart") { run(String(localized: "Radio restarting. MeshChat reconnects when it's back, in about 15 seconds.")) { try await model.engine.reboot() } }
-        } message: { Text("It's offline for about 15 seconds. Settings and messages waiting on it are kept.") }
-        .confirmationDialog("Erase the radio?", isPresented: $confirmErase, titleVisibility: .visible) {
-            Button("Erase…", role: .destructive) { typedName = ""; typingName = true }
-        } message: {
-            Text(eraseWarning)
         }
         .alert("Type the radio's name to erase it", isPresented: $typingName) {
             TextField(model.me?.name ?? String(localized: "Name"), text: $typedName)
@@ -448,6 +446,7 @@ private struct AddNetworkFromCodeView: View {
 }
 
 /// The radio's Bluetooth pairing PIN, for Settings › Connection.
+/// Setting the radio's Bluetooth PIN (its page's title says what it is, so no header).
 struct BluetoothPinSection: View {
     @Environment(AppModel.self) private var model
     @State private var pin = ""
@@ -474,7 +473,7 @@ struct BluetoothPinSection: View {
                 }
             }
             .disabled(BluetoothPin(pin) == nil || !model.isConnected || busy)
-        } header: { Text("Bluetooth PIN") } footer: {
+        } footer: {
             Text(String(localized: "For pairing over Bluetooth: six digits, not starting with 0.")
                  + (model.device?.blePin == 123456 ? " " + String(localized: "The radio still uses the firmware's default PIN 123456, so anyone nearby could pair with it.") : ""))
         }
@@ -514,8 +513,6 @@ struct HomeLocationView: View {
                     #if os(iOS)
                     .keyboardType(.numbersAndPunctuation)
                     #endif
-                Button("Save") { model.home = parsed; problem = nil }
-                    .disabled(parsed == nil || parsed == model.home)
             } header: { Text("Home") } footer: {
                 // (the coordinates as they're typed and pasted: a point for the decimals, whatever the language)
                 Text((model.home.map { String(localized: "Saved: \(String(format: "%.5f, %.5f", $0.latitude, $0.longitude)).") } ?? String(localized: "Not set.")) + " ")
@@ -539,19 +536,34 @@ struct HomeLocationView: View {
         .onAppear {
             if let h = model.home { latitude = String(format: "%.5f", h.latitude); longitude = String(format: "%.5f", h.longitude) }
         }
+        // saved as you type, once the two numbers make a position and you pause (not at every keystroke,
+        // when "50.7" is on its way to "50.75"); empty fields never clear it: that's what Clear home is for
+        .task(id: "\(latitude)|\(longitude)") {
+            try? await Task.sleep(for: .milliseconds(700))
+            guard !Task.isCancelled else { return }
+            save()
+        }
+        .onDisappear(perform: save)
+    }
+
+    private func save() {
+        if let p = parsed, p != model.home { model.home = p; problem = nil }
+    }
+
+    private func show(_ p: Position) {
+        latitude = String(format: "%.5f", p.latitude); longitude = String(format: "%.5f", p.longitude); problem = nil
     }
 
     private func readPasted() {
-        if let p = Geo.parseCoordinates(pasted) {
-            latitude = String(format: "%.5f", p.latitude); longitude = String(format: "%.5f", p.longitude); problem = nil
-        } else { problem = String(localized: "No coordinates found in that.") }
+        if let p = Geo.parseCoordinates(pasted) { show(p); model.home = p }
+        else { problem = String(localized: "No coordinates found in that.") }
     }
 
     private func locate() async {
         locating = true; defer { locating = false }
         do {
             let p = try await locator.current()
-            latitude = String(format: "%.5f", p.latitude); longitude = String(format: "%.5f", p.longitude); problem = nil
+            show(p); model.home = p
         } catch { problem = "\(error)" }
     }
 }

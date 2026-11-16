@@ -83,11 +83,43 @@ public struct RepeaterAnalysis: Sendable {
         public let lastDirect: Date?
         /// packets passed on per 10 minutes, the last 3 hours (oldest first)
         public let activity: [Int]
+        /// the typical (median) signal of the last packets heard straight from it (`recentCount`): how it reaches you lately
+        public var recentSnr: Double? = nil
         public var id: String { key }
+
+        /// Heard straight from it in the last hour (`directTimeout`): a neighbour now, not one that once was.
+        public func heardDirectly(now: Date = .now) -> Bool {
+            guard let d = lastDirect else { return false }
+            return now.timeIntervalSince1970 - d.timeIntervalSince1970 < RepeaterAnalysis.directTimeout
+        }
+
+        /// The order of repeaters heard directly: the ones heard lately first (in the last 5 minutes, then
+        /// the last 30, then longer ago, as the heard badge shows), and within each, the strongest lately
+        /// first, then the one heard last. Those never heard directly go last.
+        public static func freshestStrongest(_ a: Summary, _ b: Summary, now: Date = .now) -> Bool {
+            func rank(_ s: Summary) -> Int {
+                switch Freshness(lastDirect: s.lastDirect, now: now) { case .live: 0; case .recent: 1; case .stale: 2; case .never: 3 }
+            }
+            let ra = rank(a), rb = rank(b)
+            if ra != rb { return ra < rb }
+            let sa = a.recentSnr ?? a.snrMedian ?? -.infinity, sb = b.recentSnr ?? b.snrMedian ?? -.infinity
+            if sa != sb { return sa > sb }
+            let la = a.lastDirect?.timeIntervalSince1970 ?? 0, lb = b.lastDirect?.timeIntervalSince1970 ?? 0
+            if la != lb { return la > lb }
+            return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        }
     }
 
-    /// A repeater you heard straight from regularly, silent for a while though enough else arrived that
-    /// some of it should have been its own: it, not the mesh, went quiet.
+    /// how many of the latest packets heard straight from a repeater make its signal "lately" (`recentSnr`)
+    public static let recentCount = 10
+    /// how long a repeater counts as heard directly after the last packet straight from it: your neighbours
+    /// are heard every few minutes, the quiet ones within the hour, while you're connected
+    public static let directTimeout: TimeInterval = 3600
+
+    /// A repeater you heard straight from regularly, silent for a while though enough else arrived lately
+    /// that some of it should have been its own: it, not the mesh, went quiet. Only recent traffic counts
+    /// (`quietWindow`): what the log held days ago, or before a gap when nothing was listening, says
+    /// nothing about now.
     public struct Quiet: Hashable, Sendable {
         public let since: Date
         public let missed: Int
@@ -103,6 +135,8 @@ public struct RepeaterAnalysis: Sendable {
     public static let activityBucket: TimeInterval = 600, activityBuckets = 18
 
     public static let quietAfter: TimeInterval = 15 * 60, quietMinHeard = 10, quietExpected = 8.0, quietNext: TimeInterval = 30 * 60
+    /// the traffic that counts as evidence of a quiet repeater: what arrived in the last 2 hours
+    public static let quietWindow: TimeInterval = 2 * 3600
 
     public let stats: [String: Stats]
     public let directory: NodeDirectory
@@ -113,6 +147,8 @@ public struct RepeaterAnalysis: Sendable {
     public let packetsCounted: Int
     public let oldest: Date?
     private let times: [Date]
+    /// your channel messages' first repeater (the one that passed each on first), with when you sent it
+    private let ownFirst: [(at: TimeInterval, key: String)]
 
     /// - Parameters:
     ///   - packets: the packet log, any order
@@ -126,6 +162,7 @@ public struct RepeaterAnalysis: Sendable {
         var unknown = 0, counted = 0
         var oldest: Date?
         var times: [Date] = []
+        var ownFirst: [(at: TimeInterval, key: String)] = []
         var cache: [String: [KnownNode]] = [:]
         var carried = Set<String>()
         let contactKeys = directory.nodes.values.filter(\.isContact).map(\.key)
@@ -227,6 +264,7 @@ public struct RepeaterAnalysis: Sendable {
             } else {
                 stats[first.key, default: Stats()].heardYou += 1
                 stats[first.key]!.heardYouLast = max(stats[first.key]!.heardYouLast, r.date)
+                ownFirst.append((r.date.timeIntervalSince1970, first.key))
             }
         }
 
@@ -247,6 +285,7 @@ public struct RepeaterAnalysis: Sendable {
         packetsCounted = counted
         self.oldest = oldest
         self.times = times
+        self.ownFirst = ownFirst
     }
 
     public func summary(_ key: String) -> Summary {
@@ -259,7 +298,8 @@ public struct RepeaterAnalysis: Sendable {
                        uncertainShare: s.relayed > 0 ? Double(s.uncertain) / Double(s.relayed) : 0,
                        direct: s.lastHop > 0, snrMedian: snr.isEmpty ? nil : snr[snr.count / 2],
                        people: s.people.count, nodes: s.nodes.count, links: s.links.count, lastSeen: s.lastSeen,
-                       lastDirect: s.lastDirect == .distantPast ? nil : s.lastDirect, activity: s.activity)
+                       lastDirect: s.lastDirect == .distantPast ? nil : s.lastDirect, activity: s.activity,
+                       recentSnr: s.signal.isEmpty ? nil : { let r = s.signal.suffix(Self.recentCount).map(\.snr).sorted(); return r[r.count / 2] }())
     }
 
     /// Every repeater that carried something, busiest first.
@@ -267,19 +307,33 @@ public struct RepeaterAnalysis: Sendable {
         stats.keys.map(summary).sorted { ($0.relayed, $1.name) > ($1.relayed, $0.name) }
     }
 
-    /// "Your" repeater: the one that most often passed on your messages first, so it hears you. Only that:
-    /// with none of your messages seen passing through a repeater, none is yours (the one heard most
-    /// isn't the same claim).
+    /// how many of your latest messages decide which repeater is yours
+    public static let yoursFrom = 5
+
+    /// "Your" repeater: the one that passed on most of your last 5 messages first (the latest on a tie), so
+    /// it hears you now; counting the whole period kept a repeater that used to carry them after another
+    /// took over. Only that: with none of your messages seen passing through a repeater, none is yours (the
+    /// one heard most isn't the same claim). `passed`: how many of the period's it passed on.
     public var yours: (key: String, passesYours: Bool, passed: Int)? {
-        guard let best = stats.filter({ $0.value.heardYou > 0 })
-            .max(by: { ($0.value.heardYou, $0.value.heardYouLast) < ($1.value.heardYou, $1.value.heardYouLast) }) else { return nil }
-        return (best.key, true, best.value.heardYou)
+        let latest = ownFirst.sorted { $0.at > $1.at }.prefix(Self.yoursFrom)
+        var tally: [String: (count: Int, last: TimeInterval)] = [:]
+        for o in latest {
+            tally[o.key, default: (0, 0)].count += 1
+            tally[o.key]!.last = max(tally[o.key]!.last, o.at)
+        }
+        guard let best = tally.max(by: { ($0.value.count, $0.value.last) < ($1.value.count, $1.value.last) }) else { return nil }
+        return (best.key, true, stats[best.key]?.heardYou ?? best.value.count)
     }
 
     public func quiet(_ key: String, now: Date = .now) -> Quiet? {
         guard let s = stats[key], s.lastHop >= Self.quietMinHeard, now.timeIntervalSince(s.lastDirect) >= Self.quietAfter else { return nil }
+        // its share of the traffic up to when it was last heard, against what arrived since, lately
+        let recent = now.addingTimeInterval(-Self.quietWindow).timeIntervalSince1970
         var before = 0, after = 0
-        for t in times { if t > s.lastDirect { after += 1 } else { before += 1 } }
+        for t in times {
+            if t.timeIntervalSince1970 <= s.lastDirect.timeIntervalSince1970 { before += 1 }
+            else if t.timeIntervalSince1970 > recent { after += 1 }
+        }
         let expected = before > 0 ? Double(s.lastHop) / Double(before) * Double(after) : 0
         guard expected >= Self.quietExpected else { return nil }
         let from = max(s.lastDirect, now.addingTimeInterval(-Self.quietNext))

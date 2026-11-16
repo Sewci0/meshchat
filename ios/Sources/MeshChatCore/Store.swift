@@ -223,6 +223,13 @@ public final class Store: Sendable {
         }
     }
 
+    /// Everything that arrived since then, in any conversation.
+    public func incoming(since: Date) throws -> [Message] {
+        try db.read { db in
+            try Message.filter(Column("direction") == Direction.incoming.rawValue && Column("date") > since).fetchAll(db)
+        }
+    }
+
     public func conversations() throws -> [ConversationSummary] {
         try db.read { db in
             try ConversationSummary.fetchAll(db, sql: """
@@ -250,6 +257,22 @@ public final class Store: Sendable {
     }
 
     /// - network: only those heard on it, and those from before networks were kept (nil: on any)
+    /// Incoming channel messages with no packet linked, newest first.
+    public func unlinkedChannelMessages(since: Date) throws -> [Message] {
+        try db.read { db in
+            try Message.filter(Column("date") > since && Column("conversation").like("chan:%") && Column("direction") == Direction.incoming.rawValue
+                               && Column("fingerprint") == nil).order(Column("id").desc).fetchAll(db)
+        }
+    }
+
+    /// The channel packets logged between two times, newest first.
+    public func channelPackets(hash: Int, from: Date, to: Date) throws -> [PacketRecord] {
+        try db.read { db in
+            try PacketRecord.filter(Column("channelHash") == hash && Column("date") >= from && Column("date") <= to)
+                .order(Column("id").desc).fetchAll(db)
+        }
+    }
+
     public func recentPackets(type: String? = nil, since: Date, network: String? = nil) throws -> [PacketRecord] {
         try db.read { db in
             var q = PacketRecord.filter(Column("date") > since)

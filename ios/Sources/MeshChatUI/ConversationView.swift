@@ -10,11 +10,15 @@ struct ConversationView: View {
     let conversation: ConversationID
     @State private var messages: [Message] = []
     @State private var draft = ""
+    /// the people picked to mention while writing: the draft shows them "@Name", sent as "@[Name]"
+    @State private var picked: [String] = []
     @State private var sendError: String?
     @State private var details: Message?
     @State private var deleting: Message?
     /// someone to block, asked about first
     @State private var blocking: BlockList.Entry?
+    /// the message Block was chosen from: its dialog points there
+    @State private var blockingFrom: Int64?
     @State private var confirmDeleteAll = false
     @State private var confirmLeave = false
     @State private var showRoute = false
@@ -27,7 +31,7 @@ struct ConversationView: View {
     @State private var atBottom = true
     /// the newest message you've had in view: incoming ones after it are "new"
     @State private var seenUpTo: Int64 = 0
-    @FocusState private var composing: Bool
+    @State private var composing = false
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -66,13 +70,6 @@ struct ConversationView: View {
             .onChange(of: atBottom) { _, now in if now { markIfSeen() } }
             .onChange(of: scenePhase) { _, phase in if phase == .active { markIfSeen() } }
             .safeAreaInset(edge: .bottom) { composer }
-            .confirmationDialog("Block \(blocking?.name ?? "")?", isPresented: .present($blocking), titleVisibility: .visible) {
-                Button("Block", role: .destructive) {
-                    if let b = blocking { model.block(name: b.name, key: b.key); reloadNow() }
-                }
-            } message: {
-                Text("Their messages are hidden on this iPhone, on channels and in direct messages, and don't notify you. They aren't told. Unblock them in Settings › Blocked.")
-            }
         }
         .onAppear(perform: load)
     }
@@ -84,13 +81,22 @@ struct ConversationView: View {
                     // where the radio moved to another network: what follows was heard (or sent) there
                     if let n = Message.networkChange(messages, at: i) { NetworkDivider(name: model.radioProfiles.name(forNetwork: n)) }
                     MessageRow(message: m, grouped: grouped(i), showSender: !isDirectPerson, mentionsMe: mentionsMe(m),
-                               mention: canMention ? { name in draft = Mentions.insert(name, into: draft); composing = true } : nil)
+                               previews: model.linkPreviews == .everywhere || (model.linkPreviews == .direct && isDirectPerson),
+                               mention: canMention ? { name in draft = Mentions.insert(name, into: draft); pick(name) } : nil)
                         .id(m.id)
                         .contextMenu { menu(for: m) }
                         .confirmationDialog("Delete this message?", isPresented: Binding(get: { deleting?.id == m.id }, set: { if !$0 { deleting = nil } }),
                                             titleVisibility: .visible) {
                             Button("Delete", role: .destructive) { if let id = m.id { Task { try? await model.engine.deleteMessage(id) } } }
                         } message: { Text("It's removed from this device only.") }
+                        .confirmationDialog("Block \(blocking?.name ?? "")?", isPresented: Binding(get: { blocking != nil && blockingFrom == m.id }, set: { if !$0 { blocking = nil; blockingFrom = nil } }),
+                                            titleVisibility: .visible) {
+                            Button("Block", role: .destructive) {
+                                if let b = blocking { model.block(name: b.name, key: b.key); reloadNow() }
+                            }
+                        } message: {
+                            Text("Their messages are hidden on this iPhone, on channels and in direct messages, and don't notify you. They aren't told. Unblock them in Settings › Blocked.")
+                        }
                 }
                 // the end of the list, to scroll to (and before iOS 18, to tell whether it's in view)
                 Color.clear.frame(height: 1).id(Self.bottom)
@@ -148,11 +154,15 @@ struct ConversationView: View {
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
         if reduceMotion { proxy.scrollTo(Self.bottom, anchor: .bottom) }
         else { withAnimation(.snappy) { proxy.scrollTo(Self.bottom, anchor: .bottom) } }
-        // once more when it's there: in a lazy stack the rows' heights are estimates until drawn, so a long
-        // scroll can stop short
+        // and again until it's there: in a lazy stack the rows' heights are estimates until drawn, so a long
+        // scroll can stop short (or, over many rows not drawn yet, barely move)
         Task {
             try? await Task.sleep(for: .milliseconds(350))
-            proxy.scrollTo(Self.bottom, anchor: .bottom)
+            for _ in 0..<8 {
+                proxy.scrollTo(Self.bottom, anchor: .bottom)
+                try? await Task.sleep(for: .milliseconds(120))
+                if atBottom { break }
+            }
         }
     }
 
@@ -245,7 +255,7 @@ struct ConversationView: View {
         Button { copyToClipboard(m.text) } label: { Label("Copy", systemImage: "doc.on.doc") }
         if m.direction == .incoming, let s = m.sender, !isDirectPerson {
             if disabledReason == nil {
-                Button { draft = "@[\(s)] " + draft; composing = true } label: { Label("Reply to \(s)", systemImage: "arrowshape.turn.up.left") }
+                Button { draft = "@\(s) " + draft; pick(s) } label: { Label("Reply to \(s)", systemImage: "arrowshape.turn.up.left") }
             }
             if let c = model.contacts.values.first(where: { $0.name == s && $0.type == .companion }) {
                 Button { model.open(.direct(c.key)) } label: { Label("Message \(s) privately", systemImage: "person.crop.circle") }
@@ -262,7 +272,7 @@ struct ConversationView: View {
         }
         if m.direction == .incoming, let s = m.sender, !s.isEmpty {
             let key: String? = if case .direct(let k) = conversation, isDirectPerson { k.hex } else { sender(of: m)?.key.hex }
-            Button(role: .destructive) { blocking = BlockList.Entry(name: s, key: key) } label: { Label("Block \(s)…", systemImage: "hand.raised") }
+            Button(role: .destructive) { blocking = BlockList.Entry(name: s, key: key); blockingFrom = m.id } label: { Label("Block \(s)…", systemImage: "hand.raised") }
         }
         Divider()
         Button(role: .destructive) { deleting = m } label: { Label("Delete", systemImage: "trash") }
@@ -347,27 +357,19 @@ struct ConversationView: View {
             if let disabledReason {
                 Text(disabledReason).font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity)
             } else {
-                if canMention, let query = Mentions.typing(in: draft) {
+                if canMention, let query = Mentions.typing(in: draft, picked: picked) {
                     mentionSuggestions(query)
                 }
                 HStack(alignment: .bottom, spacing: 8) {
-                    if canMention {
-                        MentionButton { draft = Mentions.start(draft); composing = true }
-                    }
-                    TextField(isDirectPerson ? "Message \(title) privately" : "Message \(title)", text: $draft, axis: .vertical)
-                        .lineLimit(1...6)
-                        .focused($composing)
-                        .onSubmit(send)
-                        #if os(iOS)
-                        .submitLabel(.send)
-                        #endif
+                    MessageField(placeholder: isDirectPerson ? String(localized: "Message \(title) privately") : String(localized: "Message \(title)"),
+                                 text: $draft, picked: picked, focused: $composing, onSubmit: send)
                         .modifier(ComposerField())
-                    SendButton(disabled: draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.utf8.count > limit, send: send)
+                    SendButton(disabled: outgoing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bytes > limit, send: send)
                 }
-                if draft.utf8.count > limit - 30 {
-                    Text("\(draft.utf8.count)/\(limit)").font(.caption2.monospacedDigit())
-                        .foregroundStyle(draft.utf8.count > limit ? .red : .secondary)
-                        .accessibilityLabel("\(draft.utf8.count) of \(limit) bytes")
+                if bytes > limit - 30 {
+                    Text("\(bytes)/\(limit)").font(.caption2.monospacedDigit())
+                        .foregroundStyle(bytes > limit ? .red : .secondary)
+                        .accessibilityLabel("\(bytes) of \(limit) bytes")
                 }
             }
         }
@@ -375,7 +377,17 @@ struct ConversationView: View {
         .modifier(ComposerBackground())
     }
 
-    /// People to mention for what's typed after "@": tap one for the full "@[Name] ".
+    /// The draft as it's sent: picked mentions in MeshCore's "@[Name]".
+    private var outgoing: String { Mentions.wire(draft, picked: picked) }
+    private var bytes: Int { outgoing.utf8.count }
+
+    /// Someone mentioned in the draft: shown "@Name", sent "@[Name]".
+    private func pick(_ name: String) {
+        if !picked.contains(name) { picked.append(name) }
+        composing = true
+    }
+
+    /// People to mention for what's typed after "@": tap one for "@Name ".
     @ViewBuilder private func mentionSuggestions(_ query: String) -> some View {
         let names = Mentions.suggestions(for: query, recent: recentSenders,
                                          others: model.contacts.values.filter { $0.type == .companion }.map(\.name), me: model.me?.name)
@@ -383,7 +395,7 @@ struct ConversationView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     ForEach(names, id: \.self) { name in
-                        Button { draft = Mentions.complete(draft, with: name) } label: {
+                        Button { draft = Mentions.complete(draft, with: name); pick(name) } label: {
                             Text("@" + name).font(.subheadline.weight(.medium)).lineLimit(1)
                         }
                         .buttonStyle(.bordered)
@@ -402,12 +414,13 @@ struct ConversationView: View {
     }
 
     private func send() {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = outgoing.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.utf8.count <= limit else { return }
-        draft = ""
+        let (was, names) = (draft, picked)
+        draft = ""; picked = []
         Task {
             do { _ = try await model.engine.send(text, to: conversation) }
-            catch { draft = text; sendError = "\(error)" }
+            catch { draft = was; picked = names; sendError = "\(error)" }
         }
     }
 }
@@ -418,11 +431,12 @@ private struct ComposerField: ViewModifier {
     func body(content: Content) -> some View {
         #if os(iOS) && !targetEnvironment(macCatalyst)
         if #available(iOS 26, *) {
-            content.textFieldStyle(.plain)
-                .padding(.horizontal, 14).padding(.vertical, 10)
+            content.padding(.horizontal, 14).padding(.vertical, 10)
                 .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 20))
         } else {
-            content.textFieldStyle(.roundedBorder)
+            content.padding(.horizontal, 10).padding(.vertical, 7)
+                .background(Color(uiColor: .systemBackground), in: .rect(cornerRadius: 18))
+                .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Color(uiColor: .separator)))
         }
         #else
         content.textFieldStyle(.roundedBorder)
@@ -485,28 +499,6 @@ private struct ComposerBackground: ViewModifier {
     }
 }
 
-/// "@", without switching the keyboard to symbols: starts a mention and shows whom to pick.
-private struct MentionButton: View {
-    let action: () -> Void
-
-    var body: some View {
-        Group {
-            #if os(iOS) && !targetEnvironment(macCatalyst)
-            if #available(iOS 26, *) {
-                Button(action: action) { Image(systemName: "at").font(.body.weight(.semibold)).frame(width: 24, height: 24) }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-            } else {
-                Button(action: action) { Image(systemName: "at.circle").font(.title) }
-            }
-            #else
-            Button(action: action) { Image(systemName: "at.circle").font(.title) }
-            #endif
-        }
-        .accessibilityLabel("Mention someone")
-    }
-}
-
 private struct SendButton: View {
     let disabled: Bool
     let send: () -> Void
@@ -537,6 +529,8 @@ struct MessageRow: View {
     let grouped: Bool
     let showSender: Bool
     var mentionsMe = false
+    /// a link's preview in the message's bubble: nil for none, true to load it without being asked
+    var previews: Bool? = nil
     /// set where you can write: tapping the sender's name mentions them
     var mention: ((String) -> Void)? = nil
 
@@ -549,11 +543,7 @@ struct MessageRow: View {
                     .contentShape(.rect)
                     .onTapGesture { mention?(s) }
             }
-            Text(Self.styled(message.text, outgoing: outgoing))
-                .padding(.horizontal, 12).padding(.vertical, 7)
-                .background(outgoing ? Color.accentColor : Color.incomingBubble, in: .rect(cornerRadius: 16))
-                .overlay { if mentionsMe { RoundedRectangle(cornerRadius: 16).strokeBorder(Color.accentColor, lineWidth: 2) } }
-                .foregroundStyle(outgoing ? .white : .primary)
+            bubble
             meta
         }
         .frame(maxWidth: .infinity, alignment: outgoing ? .trailing : .leading)
@@ -567,8 +557,55 @@ struct MessageRow: View {
         }
     }
 
-    /// Mentions ("@[name]", as MeshCore apps write them) as a bold, tinted @name.
+    /// The bubble. A message with a link has the link's preview on top, in the same bubble as its text, as
+    /// in Messages; one that's nothing but the link is just the preview, once that has loaded.
+    @ViewBuilder private var bubble: some View {
+        #if os(iOS)
+        if let previews, let link = Links.find(in: message.text).first(where: { Links.fetchable($0.url) }) {
+            let onlyLink = message.text[link.range].count == message.text.trimmingCharacters(in: .whitespacesAndNewlines).count
+            VStack(alignment: .leading, spacing: 0) {
+                LinkPreviewCard(url: link.url, auto: previews, outgoing: outgoing)
+                if !(onlyLink && LinkPreviews.shared.isLoaded(link.url)) { text.frame(maxWidth: .infinity, alignment: .leading) }
+            }
+            .frame(maxWidth: 260)
+            .background(outgoing ? Color.accentColor : Color.incomingBubble)
+            .clipShape(.rect(cornerRadius: 16))
+            .overlay { if mentionsMe { RoundedRectangle(cornerRadius: 16).strokeBorder(Color.accentColor, lineWidth: 2) } }
+            .foregroundStyle(outgoing ? .white : .primary)
+        } else {
+            plainBubble
+        }
+        #else
+        plainBubble
+        #endif
+    }
+
+    private var plainBubble: some View {
+        text
+            .background(outgoing ? Color.accentColor : Color.incomingBubble, in: .rect(cornerRadius: 16))
+            .overlay { if mentionsMe { RoundedRectangle(cornerRadius: 16).strokeBorder(Color.accentColor, lineWidth: 2) } }
+            .foregroundStyle(outgoing ? .white : .primary)
+    }
+
+    private var text: some View {
+        Text(Self.styled(message.text, outgoing: outgoing))
+            .tint(outgoing ? .white : .accentColor)   // links: tappable, underlined
+            .padding(.horizontal, 12).padding(.vertical, 7)
+    }
+
+    /// Mentions ("@[name]", as MeshCore apps write them) as a bold, tinted @name, and web links as links.
     static func styled(_ text: String, outgoing: Bool) -> AttributedString {
+        var out = mentionsStyled(text, outgoing: outgoing)
+        let plain = String(out.characters)
+        for link in Links.find(in: plain) {
+            guard let range = Range(link.range, in: out) else { continue }
+            out[range].link = link.url
+            out[range].underlineStyle = .single
+        }
+        return out
+    }
+
+    private static func mentionsStyled(_ text: String, outgoing: Bool) -> AttributedString {
         var out = AttributedString()
         var rest = Substring(text)
         while let open = rest.range(of: "@["), let close = rest[open.upperBound...].firstIndex(of: "]") {

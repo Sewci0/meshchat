@@ -387,6 +387,26 @@ extension MeshCoreClient {
         return b
     }
 
+    /// The radio's own numbers: two short questions (core, then radio). Firmware older than protocol 8
+    /// answers with an error.
+    public func stats() async throws -> RadioStats {
+        func ask(_ kind: UInt8) async throws -> ByteReader {
+            let reply = try await single(Codec.getStats(kind), timeout: .seconds(4)) { if case .stats(kind, _) = $0 { true } else { false } }
+            guard case .stats(_, let body) = reply else { throw RadioError.malformed }
+            return ByteReader(body)
+        }
+        var core = try await ask(0)
+        _ = try core.u16()   // battery
+        let uptime = Int(try core.u32())
+        _ = try core.u16()   // error flags
+        let queued = Int(try core.u8())
+        var radio = try await ask(1)
+        let noise = Int(Int16(bitPattern: try radio.u16()))
+        _ = try radio.u8(); _ = try radio.u8()   // the last packet's RSSI and SNR
+        let tx = Int(try radio.u32()), rx = Int(try radio.u32())
+        return RadioStats(uptimeSeconds: uptime, queued: queued, noiseFloor: noise, txAirSeconds: tx, rxAirSeconds: rx)
+    }
+
     /// Restarts the radio (no reply: the connection drops).
     public func reboot() async throws { try await transport.send(Codec.reboot()) }
 

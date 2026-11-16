@@ -101,7 +101,9 @@ enum Grid {
 }
 
 /// Three rows, about 150 pt: who you're connected to (and the battery, and what waits); the mesh at a
-/// glance (packets over the hour, repeaters heard, signal); the newest unread message.
+/// glance (packets over the hour, repeaters heard, signal); then the newest unread message, or how your
+/// last message went (for 10 minutes), or else people heard in the last hour and the radio's own numbers
+/// (airtime, uptime).
 ///
 /// ```
 /// ((•))  meshcore.local                   ▮▮▯ 3.95 V
@@ -140,9 +142,14 @@ struct LockScreenStatus: View {
                 MeshStrip(state: s)
                     .opacity(s.link == .connecting || stale ? 0.5 : 1)
             }
-            // 3: the newest message, or how your last went
-            MessageRow(state: s)
-                .opacity(s.link == .connecting ? 0.5 : 1)
+            // 3: the newest message, or how your last went, or the radio's own numbers
+            if s.msg != nil || s.sent != nil {
+                MessageRow(state: s)
+                    .opacity(s.link == .connecting ? 0.5 : 1)
+            } else if s.link != .offline, s.people != nil || s.upSince != nil {
+                MeshStrip(state: s, radio: true)
+                    .opacity(s.link == .connecting || stale ? 0.5 : 1)
+            }
         }
         .padding(12)
         .tint(dimmed ? .primary : .accentColor)
@@ -169,8 +176,45 @@ struct LockScreenStatus: View {
 /// Packets over the hour, repeaters heard directly (or your repeater gone quiet), the signal lately.
 struct MeshStrip: View {
     let state: Status
+    /// instead: people heard in the last hour, and the radio's own airtime and uptime
+    var radio = false
 
-    var body: some View { strip(state, labels: true) }
+    var body: some View { if radio { radioStrip(state) } else { strip(state, labels: true) } }
+
+    /// The same three columns: people heard in the last hour (who wrote, or whose advert arrived); then,
+    /// from a radio that tells, the share of its time spent sending and receiving since it started, and how
+    /// long ago that was.
+    private func radioStrip(_ s: Status) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            cell(width: Grid.side) {
+                HStack(spacing: 4) {
+                    Image(systemName: "person.2.fill")
+                    if let n = s.people { Text(n == 0 ? "nobody" : n == 1 ? "1 person" : "\(n) people").monospacedDigit().lineLimit(1) }
+                    else { Text(verbatim: "—") }
+                }
+                .font(.subheadline.weight(.semibold)).minimumScaleFactor(0.8)
+                .foregroundStyle(s.people == 0 ? .secondary : .primary)
+            } label: { Text("heard, 1 h") }
+            cell {
+                if let tx = s.txShare, let rx = s.rxShare {
+                    Text(verbatim: "TX \(Self.share(tx)) · RX \(Self.share(rx))")
+                        .font(.subheadline.weight(.semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.8)
+                }
+            } label: { if s.txShare != nil, s.rxShare != nil { Text("airtime") } }
+            cell(width: Grid.side, align: .trailing) {
+                if let up = s.upSince { Text(verbatim: Self.uptime(since: up)).font(.subheadline.weight(.semibold)).monospacedDigit().lineLimit(1) }
+            } label: { if s.upSince != nil { Text("uptime") } }
+        }
+    }
+
+    /// "0.4%" under a tenth, "12%" from there.
+    private static func share(_ x: Double) -> String { x.formatted(.percent.precision(.fractionLength(x < 0.1 ? 1 : 0))) }
+
+    /// "2d 4h", "3h 12m".
+    private static func uptime(since: Date) -> String {
+        Duration.seconds(max(60, Date.now.timeIntervalSince(since)))
+            .formatted(.units(allowed: [.days, .hours, .minutes], width: .narrow, maximumUnitCount: 2))
+    }
 
     /// `92 | flexible | 92`: the packets column on the left edge, the repeaters in the middle, the
     /// signal right-aligned under the battery and unread count. Labels align as their values do.
@@ -259,16 +303,26 @@ struct MessageRow: View {
                 }
             }
         } else if let sent = state.sent {
-            HStack(alignment: .firstTextBaseline, spacing: spacing) {
-                Image(systemName: sent.ok == true ? "checkmark.circle.fill" : sent.ok == false ? "exclamationmark.circle.fill" : "clock")
-                    .foregroundStyle(sent.ok == true ? Color.green : sent.ok == false ? .orange : .secondary)
-                    .frame(width: gutter > 0 ? gutter : nil)
-                Text("Your last message: \(sent.status)").font(.subheadline).lineLimit(1)
-                Spacer(minLength: 4)
-                Ago(date: sent.at).font(.caption).foregroundStyle(.secondary)
+            // your last message, laid out as a message is: where it went and when, then how it went (in
+            // full, on a line of its own) and what it said
+            let colour: Color = sent.ok == true ? .green : sent.ok == false ? .orange : .secondary
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: spacing) {
+                    Image(systemName: sent.ok == true ? "checkmark.circle.fill" : sent.ok == false ? "exclamationmark.circle.fill" : "clock")
+                        .font(.caption).foregroundStyle(colour)
+                        .frame(width: gutter > 0 ? gutter : nil)
+                    Group { if let to = sent.to { Text("To \(to)") } else { Text("Your last message") } }
+                        .font(.subheadline.weight(.semibold)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Ago(date: sent.at).font(.caption).foregroundStyle(.secondary)
+                }
+                (Text(sent.detail ?? sent.status).fontWeight(.medium).foregroundStyle(colour)
+                 + Text(verbatim: sent.text.map { " · " + $0 } ?? "").foregroundStyle(.secondary))
+                    .font(.subheadline).lineLimit(2)
+                    .padding(.leading, gutter > 0 ? Grid.text : 0)
             }
         }
-        // nothing unread and nothing sent lately: no row at all (the card gets shorter)
+        // nothing unread and nothing sent lately: the lock screen shows the radio's numbers instead
     }
 }
 

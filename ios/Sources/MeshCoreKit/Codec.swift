@@ -13,7 +13,7 @@ enum Command: UInt8 {
          sendTelemetryRequest = 39,
          setTuning = 21, getCustomVars = 40, setCustomVar = 41, getTuning = 43,
          sendBinaryRequest = 50, factoryReset = 51,
-         sendControlData = 55, setAutoAdd = 58, getAutoAdd = 59, getRepeatFrequencies = 60, setPathHashMode = 61,
+         sendControlData = 55, getStats = 56, setAutoAdd = 58, getAutoAdd = 59, getRepeatFrequencies = 60, setPathHashMode = 61,
          setFloodScope = 63, getFloodScope = 64, runCommand = 66
 }
 
@@ -21,7 +21,7 @@ enum ReplyCode: UInt8 {
     case ok = 0, error = 1, contactsStart = 2, contact = 3, endOfContacts = 4, selfInfo = 5, sent = 6,
          contactMessage = 7, channelMessage = 8, currentTime = 9, noMoreMessages = 10, battery = 12,
          deviceInfo = 13, disabled = 15, contactMessageV3 = 16, channelMessageV3 = 17, channelInfo = 18,
-         customVars = 21, tuning = 23, autoAdd = 25, repeatFrequencies = 26, floodScope = 28, commandReply = 29
+         customVars = 21, tuning = 23, stats = 24, autoAdd = 25, repeatFrequencies = 26, floodScope = 28, commandReply = 29
 }
 
 enum PushCode: UInt8 {
@@ -87,6 +87,8 @@ enum Reply: Sendable {
     case disabled
     case customVars([(name: String, value: String)])
     case tuning(TuningParams)
+    /// the radio's own numbers, one kind at a time (0: core, 1: radio, 2: packets)
+    case stats(kind: UInt8, body: Data)
     case autoAdd(AutoAddConfig)
     case repeatFrequencies([FrequencyRange])
     case floodScope(FloodScope?)
@@ -164,6 +166,9 @@ enum Codec {
         case .channelMessage, .channelMessageV3: return .message(.channel(try channelMessage(&r, v3: c == .channelMessageV3)))
         case .noMoreMessages: return .noMoreMessages
         case .currentTime: return .currentTime(try r.u32())
+        case .stats:
+            let kind = try r.u8()
+            return .stats(kind: kind, body: try r.bytes(r.remaining))
         case .battery:
             return .battery(BatteryInfo(millivolts: Int(try r.u16()), storageUsedKB: Int(try r.u32()), storageTotalKB: Int(try r.u32())))
         case .deviceInfo: return .deviceInfo(try deviceInfo(&r))
@@ -429,6 +434,7 @@ enum Codec {
 
     static func setTxPower(_ dbm: Int) -> Data { Data([Command.setTxPower.rawValue, UInt8(bitPattern: Int8(clamping: dbm))]) }
     static func getBattery() -> Data { Data([Command.getBattery.rawValue]) }
+    static func getStats(_ kind: UInt8) -> Data { Data([Command.getStats.rawValue, kind]) }
     static func reboot() -> Data { Data([Command.reboot.rawValue]) + Data("reboot".utf8) }
     static func setDevicePin(_ pin: UInt32) -> Data { var w = ByteWriter(Command.setDevicePin.rawValue); w.u32(pin); return w.data }
 

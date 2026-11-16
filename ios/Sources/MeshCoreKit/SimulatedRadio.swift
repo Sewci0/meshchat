@@ -92,6 +92,13 @@ public final class SimulatedRadio: MeshTransport, @unchecked Sendable {
             let s = (try r.u32(), try r.u32(), try r.u8(), try r.u8())
             lock.withLock { radio = s }
             push(Data([0]))
+        case 56:   // the radio's own numbers: up 2 days, noise −112 dBm, 9 minutes sending and 3 hours receiving
+            let kind = try r.u8()
+            var w = ByteWriter(24); w.u8(kind)
+            if kind == 0 { w.u16(4120); w.u32(172_800); w.u16(0); w.u8(0) }
+            else if kind == 1 { w.u16(UInt16(bitPattern: -112)); w.i8(-98); w.i8(29); w.u32(540); w.u32(10_800) }
+            else { push(Data([1, 6])); break }
+            push(w.data)
         case 5:    // time: well in the past, so the engine sets it
             var w = ByteWriter(9); w.u32(1_000); push(w.data)
         case 4:    // contacts

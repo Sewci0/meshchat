@@ -68,9 +68,14 @@ struct MapTab: View {
     @State private var showOffline = false
     @State private var focus: MapFocus?
     @State private var focusSerial = 0
+    /// the map has been moved somewhere on purpose (centred, or fitted to a repeater's links): coming
+    /// back to it from a page pushed over it leaves it there
+    @State private var placed = false
     /// the repeaters worked out from the packet log (shared with the Repeaters tab), for the card's numbers
     @State private var analysis: RepeaterAnalysis?
     @State private var showLinks = false
+    /// links asked for from a repeater's page: shown once it's selected
+    @State private var linksFor: String?
     @State private var cardHeight: CGFloat = 0
 
     /// what was heard on the radio's network (contacts heard only on others aren't drawn)
@@ -82,14 +87,19 @@ struct MapTab: View {
                 if let provider {
                     let content = content
                     let route = model.mapRoute
-                    let points = route?.points ?? content.points.filter { kinds.contains($0.kind) && (!contactsOnly || $0.isContact || $0.kind == .home) }
+                    let all = route?.points ?? content.points.filter { kinds.contains($0.kind) && (!contactsOnly || $0.isContact || $0.kind == .home) }
                     let selected = selection.flatMap { id in content.points.first { $0.id == id } ?? route?.points.first { $0.id == id } }
-                    let links = showLinks ? selected.flatMap { s in analysis.map { MapLinks.lines(from: s.id, analysis: $0) } } ?? [] : []
+                    let linking = showLinks && route == nil && selected != nil && analysis != nil
+                    let links = linking ? MapLinks.lines(from: selected!.id, analysis: analysis!) : []
+                    // its links shown: only it, the repeaters at their other ends and home, each on its own
+                    // (whatever the filters hide)
+                    let linked = linking ? Set(MapLinks.linked(from: selected!.id, analysis: analysis!) + [selected!.id, "home"]) : []
+                    let points = linking ? content.points.filter { linked.contains($0.id) } : all
                     // the whole screen, under the navigation and tab bars; the cards stay clear of them
                     // (the bars above and below are about as tall, so the screen's centre is the middle of
                     // what's in view; only the card needs room)
                     ZStack {
-                        provider.map(points: points, route: route?.positions ?? [], links: links, clustered: route == nil && grouping, focus: focus,
+                        provider.map(points: points, route: route?.positions ?? [], links: links, clustered: route == nil && grouping && !linking, focus: focus,
                                      selection: $selection, bottomInset: selected == nil ? 0 : cardHeight + 8)
                             .ignoresSafeArea()
                     }
@@ -145,24 +155,43 @@ struct MapTab: View {
             .onAppear {
                 model.reloadHeard()
                 if model.mapFocus != nil { focusRequested() }
-                else if focus == nil, model.mapRoute == nil, model.isDemo { center(on: DemoMesh.overview, zoom: DemoMesh.overviewZoom) }
-                else if focus == nil, model.mapRoute == nil, let home = model.home { center(on: home) }   // a route fits itself
+                else if !placed, model.mapRoute == nil, model.isDemo { center(on: DemoMesh.overview, zoom: DemoMesh.overviewZoom) }
+                else if !placed, model.mapRoute == nil, let home = model.home { center(on: home) }   // a route fits itself
             }
             .onChange(of: model.mapFocus) { focusRequested() }
-            .onChange(of: selection) { showLinks = false }
-            // the card's numbers, worked out once and shared (a tap never waits for them)
-            .task(id: model.packetVersion / 25) { analysis = await model.repeaterAnalysis(days: 7) }
+            .onChange(of: selection) { _, now in showLinks = now != nil && now == linksFor; linksFor = nil }
+            // the card's numbers, worked out in the background and kept current (a tap never waits for them)
+            .task(id: model.distanceOrigin.map { "\($0.latitude),\($0.longitude)" } ?? "") {
+                var last: (packets: Int, at: TimeInterval) = (-1, 0)
+                while !Task.isCancelled {
+                    let now = Date.now.timeIntervalSince1970
+                    if model.packetVersion != last.packets || now - last.at >= 60 {
+                        last = (model.packetVersion, now)
+                        analysis = await model.repeaterAnalysis(days: 7)
+                    }
+                    try? await Task.sleep(for: .seconds(10))
+                }
+            }
         }
     }
 
     private func center(on p: Position, zoom: Double? = nil) {
         focusSerial += 1
         focus = MapFocus(p, serial: focusSerial, zoom: zoom)
+        placed = true
     }
 
-    /// "Show on map" from elsewhere: select the node and centre on it.
+    /// "Show on map" from elsewhere: select the node and centre on it. With its links, the map fits it and
+    /// the repeaters at their other ends once they're drawn instead.
     private func focusRequested() {
         guard let f = model.mapFocus else { return }
+        if model.mapShowsLinks {
+            model.mapShowsLinks = false
+            model.mapFocus = nil
+            placed = true
+            if selection == f { showLinks = true } else { linksFor = f; selection = f }
+            return
+        }
         selection = f
         if let p = content.points.first(where: { $0.id == f }) { center(on: p.position) }
         model.mapFocus = nil

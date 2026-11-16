@@ -9,7 +9,7 @@ struct RepeatersView: View {
     @State private var analysis: RepeaterAnalysis?
     @AppStorage("repeatersDays") private var days = 7
     @AppStorage("repeatersShow") private var show: RepeaterFilter = .all
-    @AppStorage("repeatersSort") private var sort: RepeaterSort = .relayed
+    @AppStorage("repeatersSort") private var sort: RepeaterSort = .signal
     @State private var query = ""
     /// a repeater's key opens its page; a new reach-check answerer, what's known of it
     @State private var path = NavigationPath()
@@ -17,10 +17,11 @@ struct RepeatersView: View {
     var body: some View {
         let list = (analysis?.list ?? []).filter { s in (query.isEmpty || s.name.localizedCaseInsensitiveContains(query)) && show.keeps(s) }
             .sorted(by: sort.inOrder)
-        // your repeater first in its list, tagged rather than shown twice
+        // your repeater first in its list, tagged rather than shown twice; by signal, where it stands is the point
         let yours = analysis?.yours
-        let pinned = list.filter { $0.key == yours?.key } + list.filter { $0.key != yours?.key }
-        let direct = pinned.filter(\.direct), further = pinned.filter { !$0.direct }
+        let pinned = sort == .signal ? list : list.filter { $0.key == yours?.key } + list.filter { $0.key != yours?.key }
+        // heard directly: in the last hour; the rest, those heard straight from earlier among them, further along
+        let direct = pinned.filter { $0.heardDirectly() }, further = pinned.filter { !$0.heardDirectly() }
         NavigationStack(path: $path) {
             List {
                 if let a = analysis {
@@ -68,7 +69,19 @@ struct RepeatersView: View {
                     }
                 }
             }
-            .task(id: "\(days)/\(model.packetVersion / 25)") { await analyse() }
+            // again as packets arrive (at most every 10 s) and every minute anyway, so it follows the radio
+            // and the time ("gone quiet", "lately") rather than showing what was true when it opened
+            .task(id: "\(days)/\(model.distanceOrigin.map { "\($0.latitude),\($0.longitude)" } ?? "")") {
+                var last: (packets: Int, at: TimeInterval) = (-1, 0)
+                while !Task.isCancelled {
+                    let now = Date.now.timeIntervalSince1970
+                    if model.packetVersion != last.packets || now - last.at >= 60 {
+                        last = (model.packetVersion, now)
+                        await analyse()
+                    }
+                    try? await Task.sleep(for: .seconds(10))
+                }
+            }
             .onAppear(perform: focusRequested)
             .onChange(of: model.repeaterFocus) { focusRequested() }
         }
@@ -99,28 +112,61 @@ struct RepeatersView: View {
 
     private func row(_ s: RepeaterAnalysis.Summary, yours: (key: String, passesYours: Bool, passed: Int)?) -> some View {
         let isYours = s.key == yours?.key
-        return VStack(alignment: .leading, spacing: 2) {
-            HStack {
-                Text(s.name).lineLimit(1)
-                if isYours { YoursTag() }
-                if s.uncertainShare > 0.3 { Text("(?)").foregroundStyle(.secondary).accessibilityLabel("ID shared with other repeaters") }
-                Spacer()
-                // the typical (median) signal of what you heard from it, not one answer's: an arrow down, as
-                // in the reach check's "you hear it"
-                if let snr = s.snrMedian {
-                    Text(String(format: "↓ %.1f dB", snr)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        .accessibilityLabel(String(localized: "typical signal \(snr, specifier: "%.1f") decibels"))
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(s.name).lineLimit(1)
+                    if isYours { YoursTag() }
+                    if s.uncertainShare > 0.3 { Text("(?)").foregroundStyle(.secondary).accessibilityLabel("ID shared with other repeaters") }
+                }
+                Text([String(localized: "\(s.relayed) passed on"), s.firstHop > 0 ? String(localized: "\(s.firstHop) entered here") : nil, s.km.map { String(format: "%.1f km", $0) },
+                      s.lastSeen == .distantPast ? nil : s.lastSeen.formatted(.relative(presentation: .named))].compactMap { $0 }.joined(separator: " · "))
+                    .font(.caption).foregroundStyle(.secondary)
+                // why it's yours
+                if isYours, let y = yours {
+                    Text(y.passed == 1 ? "One of your messages entered the mesh through it" : "\(y.passed) of your messages entered the mesh through it")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+            VStack(alignment: .trailing, spacing: 2) {
+                // the typical (median) signal of the last packets heard from it, not one answer's, as bars
+                // like a phone's reception and in dB: an arrow down, as in the reach check's "you hear it"
+                // (only while it's heard directly: an older reading isn't how it reaches you now)
+                if s.heardDirectly(), let snr = s.recentSnr ?? s.snrMedian {
+                    HStack(spacing: 4) {
+                        SignalStrength(snr: snr, spreadingFactor: model.knownSpreadingFactor)
+                        Text(String(format: "↓ %.1f dB", snr)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            .accessibilityLabel(String(localized: "typical signal \(snr, specifier: "%.1f") decibels"))
+                    }
                 }
                 HeardBadge(lastDirect: s.lastDirect)
             }
-            Text([String(localized: "\(s.relayed) passed on"), s.firstHop > 0 ? String(localized: "\(s.firstHop) entered here") : nil, s.km.map { String(format: "%.1f km", $0) },
-                  s.lastSeen == .distantPast ? nil : s.lastSeen.formatted(.relative(presentation: .named))].compactMap { $0 }.joined(separator: " · "))
-                .font(.caption).foregroundStyle(.secondary)
-            // why it's yours
-            if isYours, let y = yours {
-                Text(y.passed == 1 ? "One of your messages entered the mesh through it" : "\(y.passed) of your messages entered the mesh through it")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
+        }
+    }
+}
+
+/// A signal as a phone shows reception: four bars, as many filled as its level (one below the limit, two
+/// marginal, three fair, four good) and coloured the same way (red, orange, yellow, green), judged by
+/// the headroom above the weakest signal LoRa decodes at the radio's spreading factor.
+struct SignalStrength: View {
+    let snr: Double
+    let spreadingFactor: Int?
+
+    var body: some View {
+        let level = SignalLevel(snr: snr, spreadingFactor: spreadingFactor ?? 8)
+        Image(systemName: "cellularbars", variableValue: Double(level.rawValue) / 4)
+            .font(.caption)
+            .foregroundStyle(Self.color(level))
+            .accessibilityLabel(level.name)
+    }
+
+    static func color(_ level: SignalLevel) -> Color {
+        switch level {
+        case .good: .green
+        case .fair: .yellow
+        case .marginal: .orange
+        case .below: .red
         }
     }
 }
@@ -239,7 +285,7 @@ struct ReachCard: View {
             : recent == 1 ? String(localized: "Hearing 1 repeater directly") : String(localized: "Hearing \(recent) repeaters directly")
         if let step { return (String(localized: "Checking reach…"), [step]) }
         if let r = result {
-            let line = String(localized: "Hearing \(recent) directly · checked \(r.at.formatted(date: .omitted, time: .shortened))")
+            let line = String(localized: "Hearing \(recent) directly · checked \(r.at.timeOrDay())")
             return (r.summary.title, [r.summary.detail, line].compactMap { $0 })
         }
         let newest = analysis.list.compactMap(\.lastDirect).max()
@@ -643,8 +689,8 @@ enum RepeaterFilter: String, CaseIterable {
     func keeps(_ s: RepeaterAnalysis.Summary) -> Bool {
         switch self {
         case .all: true
-        case .direct: s.direct
-        case .further: !s.direct
+        case .direct: s.heardDirectly()
+        case .further: !s.heardDirectly()
         case .contacts: s.isContact
         case .located: s.position != nil
         }
@@ -668,7 +714,8 @@ enum RepeaterSort: String, CaseIterable {
     func inOrder(_ a: RepeaterAnalysis.Summary, _ b: RepeaterAnalysis.Summary) -> Bool {
         switch self {
         case .relayed: (a.relayed, b.name) > (b.relayed, a.name)
-        case .signal: (a.snrMedian ?? -.infinity, b.name) > (b.snrMedian ?? -.infinity, a.name)
+        // heard lately first, then the strongest lately (the order "Heard directly" is read in)
+        case .signal: RepeaterAnalysis.Summary.freshestStrongest(a, b)
         case .distance: (a.km ?? .infinity, a.name) < (b.km ?? .infinity, b.name)
         case .heard: (a.lastSeen, b.name) > (b.lastSeen, a.name)
         case .name: a.name.localizedStandardCompare(b.name) == .orderedAscending
@@ -686,7 +733,7 @@ struct QuietWarning: View {
         Label {
             VStack(alignment: .leading, spacing: 4) {
                 Text("\(name) has gone quiet").font(.subheadline.weight(.semibold))
-                Text("Nothing heard straight from it since \(quiet.since.formatted(date: .omitted, time: .shortened)), while \(quiet.missed) packets arrived (about \(quiet.expected) would usually be its own). Your messages may not get through.")
+                Text("Nothing heard straight from it since \(quiet.since.timeOrDay()), while \(quiet.missed) packets arrived (about \(quiet.expected) would usually be its own). Your messages may not get through.")
                     .font(.caption)
                 if let n = quiet.next {
                     let signal = String(format: "%.1f dB", n.snr)
@@ -705,6 +752,7 @@ struct QuietWarning: View {
 /// live status and neighbours on request.
 struct RepeaterDetailView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
     let analysis: RepeaterAnalysis
     let key: String
     @State private var tab: Int
@@ -769,7 +817,16 @@ struct RepeaterDetailView: View {
         } footer: { Text("Who enters the mesh through it: the first repeater in their packets' paths.") }
     }
 
-    private func links(_ st: RepeaterAnalysis.Stats) -> some View {
+    @ViewBuilder private func links(_ st: RepeaterAnalysis.Stats) -> some View {
+        // on the map: it and the repeaters it links with that have a position, joined by lines
+        if !MapLinks.linked(from: key, analysis: analysis).isEmpty {
+            Section {
+                Button {
+                    if model.tab == .map { dismiss() }   // opened from the map's card: back to the map
+                    model.showLinksOnMap(key)
+                } label: { Label("Show on map", systemImage: "map") }
+            }
+        }
         Section {
             ForEach(st.links.values.sorted { $0.to + $0.from > $1.to + $1.from }) { l in
                 LabeledContent(analysis.directory.nodes[l.key]?.name ?? String(l.key.prefix(8)), value: "→ \(l.to)  ← \(l.from)")
@@ -836,7 +893,7 @@ struct NewRepeaterView: View {
                 if let v = r.verdict { LabeledContent("Reach") { VerdictLabel(verdict: v).fixedSize() } }
                 LabeledContent("It hears you", value: ReachText.db(r.up))
                 LabeledContent("You hear it", value: ReachText.db(r.down))
-                LabeledContent("Checked", value: answer.at.formatted(date: .omitted, time: .shortened))
+                LabeledContent("Checked", value: answer.at.timeOrDay())
             } header: { Text("Its answer") }
             Section {
                 LabeledContent("Key starts") { Text(r.id).font(.body.monospaced()).textSelection(.enabled) }
